@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import copy
 import os
 import matplotlib
 import matplotlib.pyplot as plt
@@ -28,6 +29,7 @@ import pandas as pd
 from collections import defaultdict
 
 import lsst.afw.table as afwTable
+import lsst.daf.butler as dafButler
 from lsst.daf.persistence.butler import Butler
 from lsst.pex.config import Field, ChoiceField
 from lsst.pipe.base import ArgumentParser, TaskRunner, TaskError, Struct
@@ -37,7 +39,7 @@ from .coaddAnalysis import (FLAGCOLORS, CoaddAnalysisConfig, CoaddAnalysisTask, 
                             CompareCoaddAnalysisTask)
 from .utils import (matchAndJoinCatalogs, makeBadArray, calibrateSourceCatalogMosaic,
                     calibrateSourceCatalogPhotoCalib, calibrateSourceCatalog, andCatalog, writeParquet,
-                    getRepoInfo, getCcdNameRefList, getDataExistsRefList, addPreComputedColumns,
+                    getRepoInfo, findCcdKey, getCcdNameRefList, getDataExistsRefList, addPreComputedColumns,
                     updateVerifyJob, savePlots, getSchema, computeAreaDict)
 from .plotUtils import annotateAxes, labelVisit, labelCamera, plotText, getPlotInfo
 from .fakesAnalysis import (addDegreePositions, matchCatalogs, addNearestNeighbor, fakesPositionCompare,
@@ -247,9 +249,57 @@ class VisitAnalysisRunner(TaskRunner):
             raise RuntimeWarning("refList from parsedCmd is empty...")
         kwargs["tract"] = parsedCmd.tract
         kwargs["subdir"] = parsedCmd.subdir
+
+        idParser = parsedCmd.id.__class__(parsedCmd.id.level)
+        idParser.idList = parsedCmd.id.idList
+        idParser.datasetType = parsedCmd.id.datasetType
+        idParser.makeDataRefList(parsedCmd)
+
+        if parsedCmd.collection is not None:
+            # For some reason the gen3 butler is needing the filter in the
+            # dataId, so it must be supplied on the command line --id.
+            if "filter" not in idParser.idList[0]:
+                raise RuntimeError("Must in include filter in the input --id")
+            repoRootDir = "/repo/dc2" if parsedCmd.instrument == "LSSTCam-imSim" else "/repo/main"
+            if parsedCmd.instrument is None:
+                raise RuntimeError("Must provide --instrument command line option for gen3 repos.")
+            butlerGen3 = dafButler.Butler(repoRootDir, collections=parsedCmd.collection,
+                                          instrument=parsedCmd.instrument)
+            butlerGen2 = parsedCmd.butler
+            parsedCmd.butler = butlerGen3
+            kwargs["butlerGen2"] = butlerGen2
+
+        ccdList = []
+        gen3RefList = []
+        ccdKey = findCcdKey(parsedCmd.id.refList[0].dataId)
+        for pId in parsedCmd.id.refList:
+            if int(pId.dataId["tract"]) == int(parsedCmd.tract):
+                ccdList.append(pId.dataId[ccdKey])
+
         visits = defaultdict(list)
-        for ref in parsedCmd.id.refList:
-            visits[ref.dataId["visit"]].append(ref)
+        if parsedCmd.collection is None:
+            for ref in parsedCmd.id.refList:
+                if int(ref.dataId["tract"]) == int(parsedCmd.tract):
+                    visits[ref.dataId["visit"]].append(ref)
+        else:
+            pIdList = copy.deepcopy(idParser.idList)
+            if len(pIdList) == 1 and len(pIdList) < len(ccdList):
+                pIdList = pIdList*len(ccdList)
+            for pId, rerunCcdId in zip(pIdList, ccdList):
+                pIdCopy = copy.deepcopy(pId)
+                if "ccd" in pIdCopy:
+                    pIdCopy["detector"] = pIdCopy.pop("ccd")
+                else:
+                    pIdCopy["detector"] = rerunCcdId
+                try:
+                    butlerGen3.getURI("calexp", dataId=pIdCopy)
+                    gen3RefList.append({"butler": butlerGen3, "camera": parsedCmd.instrument,
+                                        "dataId": pIdCopy})
+                except LookupError:
+                    continue
+            for ref in gen3RefList:
+                visits[ref["dataId"]["visit"]].append(ref)
+
         return [(visits[key], kwargs) for key in visits.keys()]
 
 
@@ -266,13 +316,25 @@ class VisitAnalysisTask(CoaddAnalysisTask):
                                "e.g. --id visit=12345 ccd=6^8..11", ContainerClass=PerTractCcdDataIdContainer)
         parser.add_argument("--tract", type=str, default=None,
                             help="Tract(s) to use (do one at a time for overlapping) e.g. 1^5^0")
+        parser.add_argument("--collection", required=False, default=None,
+                            help="Collection for run if it is Gen3.  NOTE: must still point to a gen2 "
+                            "input to get a valid parsed data reference list and a gen2-stlye rerun for "
+                            "plot persistence. E.g. "
+                            "/datasets/hsc/repo/ --rerun RC/w_2021_NN/DM-NNNNN-sfm:private/username/outDir "
+                            "--collection HSC/runs/RC2/w_2021_NN/DM-NNNNN --instrument HSC or"
+                            "/datasets/DC2/repoRun2.2i "
+                            "--rerun w_2021_NN/DM-NNNNN/sfm:private/username/outDir "
+                            " --collection 2.2i/runs/test-med-1/w_2021_NN/DM-NNNNN "
+                            "--instrument LSSTCam-imSim")
+        parser.add_argument("--instrument", required=False, default=None,
+                            help="Instrument for run if it is Gen3")
         parser.add_argument("--subdir", type=str, default="",
                             help=("Subdirectory below plots/filter/tract-NNNN/visit-NNNN (useful "
                                   "for, e.g., subgrouping of CCDs.  Ignored if only one CCD is "
                                   "specified, in which case the subdir is set to ccd-NNN"))
         return parser
 
-    def runDataRef(self, dataRefList, tract=None, subdir=""):
+    def runDataRef(self, dataRefList, tract=None, subdir="", butlerGen2=None):
         plotList = []
         dataset = "source" if self.config.doReadParquetTables else "src"
         self.log.info("dataRefList size: {:d}".format(len(dataRefList)))
@@ -282,8 +344,13 @@ class VisitAnalysisTask(CoaddAnalysisTask):
             tractList = [int(tractStr) for tractStr in tract.split("^")]
         dataRefListPerTract = [None]*len(tractList)
         for i, tract in enumerate(tractList):
-            dataRefListPerTract[i] = [dataRef for dataRef in dataRefList if
-                                      dataRef.dataId["tract"] == tract and dataRef.datasetExists(dataset)]
+            dataRefListPerTract[i] = []
+            for dataRef in dataRefList:
+                if isinstance(dataRef, dict):
+                    if "dataId" in dataRef:
+                        dataRef["dataId"].update({"tract": int(tract)})
+                dataRefListPerTract[i].append(dataRef)
+
         commonZpDone = False
         self.catLabel = ""
 
@@ -294,13 +361,13 @@ class VisitAnalysisTask(CoaddAnalysisTask):
                 else:
                     self.log.info("No data found for tract: {:d}".format(tractList[i]))
                     continue
-            repoInfo = getRepoInfo(dataRefListTract[0], catDataset=dataset,
+            _, ccdListPerTract = getDataExistsRefList(dataRefListTract, dataset)
+            repoInfo = getRepoInfo(dataRefListTract[ccdListPerTract[0]], catDataset=dataset,
                                    doApplyExternalPhotoCalib=self.config.doApplyExternalPhotoCalib,
                                    externalPhotoCalibName=self.config.externalPhotoCalibName,
                                    doApplyExternalSkyWcs=self.config.doApplyExternalSkyWcs,
                                    externalSkyWcsName=self.config.externalSkyWcsName)
             self.log.info("dataId: {!s:s}".format(repoInfo.dataId))
-            ccdListPerTract = getDataExistsRefList(dataRefListTract, repoInfo.catDataset)
 
             plotInfoDict = getPlotInfo(repoInfo)
             subdir = "ccd-" + str(ccdListPerTract[0]) if len(ccdListPerTract) == 1 else subdir
@@ -313,16 +380,17 @@ class VisitAnalysisTask(CoaddAnalysisTask):
             if not ccdListPerTract:
                 raise RuntimeError("No datasets found for datasetType = {:s}".format(repoInfo.catDataset))
             if self.config.doApplyExternalPhotoCalib:
-                ccdPhotoCalibListPerTract = getDataExistsRefList(dataRefListTract, repoInfo.photoCalibDataset)
+                _, ccdPhotoCalibListPerTract = getDataExistsRefList(dataRefListTract,
+                                                                    repoInfo.photoCalibDataset)
                 if not ccdPhotoCalibListPerTract:
                     self.log.fatal(f"No data found for {repoInfo.photoCalibDataset} dataset...are you sure "
                                    "you ran the external photometric calibration?  If not, run with "
                                    "--config doApplyExternalPhotoCalib=False")
             if self.config.doApplyExternalSkyWcs:
                 # Check for wcs for compatibility with old dataset naming
-                ccdSkyWcsListPerTract = getDataExistsRefList(dataRefListTract, repoInfo.skyWcsDataset)
+                _, ccdSkyWcsListPerTract = getDataExistsRefList(dataRefListTract, repoInfo.skyWcsDataset)
                 if not ccdSkyWcsListPerTract:
-                    ccdSkyWcsListPerTract = getDataExistsRefList(dataRefListTract, "wcs")
+                    _, ccdSkyWcsListPerTract = getDataExistsRefList(dataRefListTract, "wcs")
                     if ccdSkyWcsListPerTract:
                         repoInfo.skyWcsDataset = "wcs"
                         self.log.info("Old meas_mosaic dataset naming: wcs (new name is jointcal_wcs)")
@@ -441,14 +509,18 @@ class VisitAnalysisTask(CoaddAnalysisTask):
                     commonZpCat = addPreComputedColumns(commonZpCat,
                                                         fluxToPlotList=self.config.fluxToPlotList,
                                                         toMilli=self.config.toMilli)
-                    dataRef_catalog = repoInfo.butler.dataRef("analysisVisitTable", dataId=repoInfo.dataId)
-                    writeParquet(dataRef_catalog, catalog, badArray=bad)
-                    dataRef_commonZp = repoInfo.butler.dataRef("analysisVisitTable_commonZp",
-                                                               dataId=repoInfo.dataId)
-                    writeParquet(dataRef_commonZp, commonZpCat, badArray=badCommonZp)
-                    if self.config.writeParquetOnly and not self.config.doPlotMatches:
-                        self.log.info("Exiting after writing Parquet tables.  No plots generated.")
-                        return
+                    if repoInfo.isGen3:
+                        self.log.info("Not writing parquet files for gen3 repo...")
+                    else:
+                        dataRef_catalog = repoInfo.butler.dataRef("analysisVisitTable",
+                                                                  dataId=repoInfo.dataId)
+                        writeParquet(dataRef_catalog, catalog, badArray=bad)
+                        dataRef_commonZp = repoInfo.butler.dataRef("analysisVisitTable_commonZp",
+                                                                   dataId=repoInfo.dataId)
+                        writeParquet(dataRef_commonZp, commonZpCat, badArray=badCommonZp)
+                        if self.config.writeParquetOnly and not self.config.doPlotMatches:
+                            self.log.info("Exiting after writing Parquet tables.  No plots generated.")
+                            return
 
                 # purge the catalogs of flagged sources
                 catalog = catalog[~bad].copy(deep=True)
@@ -546,7 +618,8 @@ class VisitAnalysisTask(CoaddAnalysisTask):
                 if self.config.doPlotCentroids and self.haveFpCoords:
                     plotList.append(self.plotCentroidXY(catalog, plotInfoDict, areaDict, **plotKwargs))
 
-            if self.config.doPlotMatches or self.config.doWriteParquetTables:
+            # Haven't got reference catalog loading working for a gen3 repo...
+            if (self.config.doPlotMatches or self.config.doWriteParquetTables) and not repoInfo.isGen3:
                 # Read in and unpack just the persisted srcMatch from SFM
                 # (which still uses ps1 for astrometric calibration).
                 sfmUnpackedMatches, _ = self.readSrcMatches(
@@ -619,10 +692,16 @@ class VisitAnalysisTask(CoaddAnalysisTask):
         if plotInfoDict["cameraName"]:
             metaDict.update({"camera": plotInfoDict["cameraName"]})
         self.verifyJob = updateVerifyJob(self.verifyJob, metaDict=metaDict)
-        verifyJobFilename = repoInfo.butler.get("visitAnalysis_verify_job_filename",
-                                                dataId=repoInfo.dataId)[0]
+        if not repoInfo.isGen3:
+            verifyJobFilename = repoInfo.butler.get("visitAnalysis_verify_job_filename",
+                                                    dataId=repoInfo.dataId)[0]
+        else:
+            verifyJobFilename = butlerGen2.get("visitAnalysis_verify_job_filename", dataId=repoInfo.dataId)[0]
         if plotList:
-            savePlots(plotList, "plotVisit", repoInfo.dataId, repoInfo.butler, subdir=subdir)
+            if repoInfo.isGen3:
+                savePlots(plotList, "plotVisit", repoInfo.dataId, butlerGen2, subdir=subdir)
+            else:
+                savePlots(plotList, "plotVisit", repoInfo.dataId, repoInfo.butler, subdir=subdir)
 
         # TODO: DM-26758 (or DM-14768) should make the following line a proper
         # butler.put by directly persisting json files.
@@ -689,8 +768,11 @@ class VisitAnalysisTask(CoaddAnalysisTask):
                 # AND you want the photoCalib flux object used for the
                 # calibration (as opposed to meas_mosaic's fcr object).
                 if not self.zpLabel:
-                    zpStr = ("MMphotoCalib" if dataRef.datasetExists("fcr_md")
-                             else repoInfo.photoCalibDataset.split("_")[0].upper())
+                    if not repoInfo.isGen3:
+                        zpStr = ("MMphotoCalib" if dataRef.datasetExists("fcr_md")
+                                 else repoInfo.photoCalibDataset.split("_")[0].upper())
+                    else:
+                        zpStr = repoInfo.photoCalibDataset.split("_")[0].upper()
                     if (iCat is None or (iCat == 0 and self.zpLabel1 is None)
                             or (iCat == 1 and self.zpLabel2 is None)):  # Suppress superfluous logging
                         msg = "Applying {0:} photoCalib calibration to catalog".format(zpStr)
@@ -699,7 +781,7 @@ class VisitAnalysisTask(CoaddAnalysisTask):
                     zpLabel = zpStr
                     zpLabel = zpLabel + "_" + str(iCat + 1) if iCat is not None else zpLabel
                 calibrated = calibrateSourceCatalogPhotoCalib(dataRef, catalog, repoInfo.photoCalibDataset,
-                                                              zp=self.zp)
+                                                              repoInfo.isGen3, zp=self.zp)
             else:
                 # If here, the data were processed pre-photoCalib output
                 # generation, so must use old method OR old method was
@@ -728,7 +810,15 @@ class VisitAnalysisTask(CoaddAnalysisTask):
             calibrated = calibrateSourceCatalog(catalog, self.zp)
 
         if doApplyExternalSkyWcs:
-            wcs = dataRef.get(repoInfo.skyWcsDataset)
+            if not repoInfo.isGen3:
+                wcs = dataRef.get(repoInfo.skyWcsDataset)
+            else:
+                dataId = dataRef["dataId"]
+                externalSkyWcsCatalog = dataRef["butler"].get(repoInfo.skyWcsDataset, dataId=dataId)
+                row = externalSkyWcsCatalog.find(dataId["detector"])
+                wcs = row.getWcs()
+            if wcs is None:
+                self.log.warn("No wcs found for dataset {} dataId{}".format(repoInfo.skyWcsDataset, dataId))
             if isinstance(calibrated, pd.DataFrame):
                 xPixelArray = np.array(calibrated["slot_Centroid_x"])
                 yPixelArray = np.array(calibrated["slot_Centroid_y"])
@@ -862,23 +952,67 @@ class CompareVisitAnalysisRunner(TaskRunner):
         # mapperArgs={} is NOT considered equivalent to
         # mapperArgs={"calibRoot": None}, so only use if pasedCmd.calib is not
         # None.
-        butlerArgs = dict(root=os.path.join(rootDir, "rerun", parsedCmd.rerun2))
-        if parsedCmd.calib is not None:
-            butlerArgs["calibRoot"] = parsedCmd.calib
-        butler2 = Butler(**butlerArgs)
+        if parsedCmd.collection is not None:
+            if parsedCmd.instrument is None:
+                raise RuntimeError("Must provide --instrument command line option for gen3 repos.")
+            butler2 = dafButler.Butler(parsedCmd.rerun2, collections=parsedCmd.collection,
+                                       instrument=parsedCmd.instrument)
+        else:
+            butlerArgs = dict(root=os.path.join(rootDir, "rerun", parsedCmd.rerun2))
+            if parsedCmd.calib is not None:
+                butlerArgs["calibRoot"] = parsedCmd.calib
+            butler2 = Butler(**butlerArgs)
+            parsedCmd.butler = butler2
         idParser = parsedCmd.id.__class__(parsedCmd.id.level)
         idParser.idList = parsedCmd.id.idList
         idParser.datasetType = parsedCmd.id.datasetType
-        butler = parsedCmd.butler
-        parsedCmd.butler = butler2
         idParser.makeDataRefList(parsedCmd)
-        parsedCmd.butler = butler
 
+        butler = parsedCmd.butler
+        rerunRefList = []
+        rerunCcdList = []
+        rerun2RefList = []
+        ccdKey = findCcdKey(parsedCmd.id.refList[0].dataId)
+        for pId in parsedCmd.id.refList:
+            if int(pId.dataId["tract"]) == int(parsedCmd.tract):
+                rerunRefList.append(pId)
+                rerunCcdList.append(pId.dataId[ccdKey])
+        if parsedCmd.collection is None:
+            for pId in idParser.refList:
+                if int(pId.dataId["tract"]) == int(parsedCmd.tract):
+                    rerun2RefList.append(pId)
+        else:
+            pIdList = copy.deepcopy(idParser.idList)
+            if len(pIdList) == 1 and len(pIdList) < len(rerunCcdList):
+                pIdList = pIdList*len(rerunCcdList)
+            for pId, rerunCcdId in zip(pIdList, rerunCcdList):
+                pIdCopy = copy.deepcopy(pId)
+                if "ccd" in pIdCopy:
+                    pIdCopy["detector"] = pIdCopy.pop("ccd")
+                else:
+                    pIdCopy["detector"] = rerunCcdId
+                try:
+                    butler2.getURI("calexp", dataId=pIdCopy)
+                    rerun2RefList.append({"butler": butler2, "camera": parsedCmd.instrument,
+                                          "dataId": pIdCopy})
+                except LookupError:
+                    continue
+
+        if len(rerunRefList) > len(rerun2RefList):  # Need to pad for missing patches in rerun2
+            dummyId = copy.deepcopy(pIdCopy)
+            dummyId["detector"] = 999
+            for iPad in range(0, len(rerunRefList) - len(rerun2RefList)):
+                rerun2RefList.append({"butler": butler2, "camera": parsedCmd.instrument,
+                                      "dataId": dummyId})
+        parsedCmd.butler = butler
         visits1 = defaultdict(list)
         visits2 = defaultdict(list)
-        for ref1, ref2 in zip(parsedCmd.id.refList, idParser.refList):
+        for ref1, ref2 in zip(rerunRefList, rerun2RefList):
             visits1[ref1.dataId["visit"]].append(ref1)
-            visits2[ref2.dataId["visit"]].append(ref2)
+            if parsedCmd.collection is None:
+                visits2[ref2.dataId["visit"]].append(ref2)
+            else:
+                visits2[ref2["dataId"]["visit"]].append(ref2)
         return [(refs1, dict(dataRefList2=refs2, **kwargs)) for
                 refs1, refs2 in zip(visits1.values(), visits2.values())]
 
@@ -896,6 +1030,10 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                                "e.g. --id visit=12345 ccd=6^8..11", ContainerClass=PerTractCcdDataIdContainer)
         parser.add_argument("--tract", type=str, default=None,
                             help="Tract(s) to use (do one at a time for overlapping) e.g. 1^5^0")
+        parser.add_argument("--collection", required=False, default=None,
+                            help="Collection for rerun2 if it is Gen3")
+        parser.add_argument("--instrument", required=False, default=None,
+                            help="Instrument for run if it is Gen3")
         parser.add_argument("--subdir", type=str, default="",
                             help=("Subdirectory below plots/filter/tract-NNNN/visit-NNNN (useful "
                                   "for, e.g., subgrouping of CCDs.  Ignored if only one CCD is "
@@ -911,11 +1049,22 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
         self.log.debug("tractList = {}".format(tractList))
         dataRefListPerTract1 = [None]*len(tractList)
         dataRefListPerTract2 = [None]*len(tractList)
+        for dataRef1 in dataRefList1:
+            if isinstance(dataRef1, dict):
+                if "dataId" in dataRef1:
+                    dataRef1["dataId"].update({"tract": int(tract)})
+        for dataRef2 in dataRefList2:
+            if isinstance(dataRef2, dict):
+                if "dataId" in dataRef2:
+                    dataRef2["dataId"].update({"tract": int(tract)})
         for i, tract in enumerate(tractList):
             dataRefListPerTract1[i] = [dataRef1 for dataRef1 in dataRefList1 if
                                        dataRef1.dataId["tract"] == tract]
-            dataRefListPerTract2[i] = [dataRef2 for dataRef2 in dataRefList2 if
-                                       dataRef2.dataId["tract"] == tract]
+            try:
+                dataRefListPerTract2[i] = [dataRef2 for dataRef2 in dataRefList2 if
+                                           dataRef2.dataId["tract"] == tract]
+            except AttributeError:
+                dataRefListPerTract2[i] = [dataRef2 for dataRef2 in dataRefList2]
         if len(dataRefListPerTract1) != len(dataRefListPerTract2):
             raise TaskError("Lengths of comparison dataRefLists do not match!")
         commonZpDone = False
@@ -948,35 +1097,34 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                                     externalPhotoCalibName=self.config.externalPhotoCalibName2,
                                     doApplyExternalSkyWcs=self.config.doApplyExternalSkyWcs2,
                                     externalSkyWcsName=self.config.externalSkyWcsName2)
-
             fullCameraCcdList1 = getCcdNameRefList(dataRefListTract1)
 
-            ccdListPerTract1 = getDataExistsRefList(dataRefListTract1, repoInfo1.catDataset)
-            ccdListPerTract2 = getDataExistsRefList(dataRefListTract2, repoInfo2.catDataset)
-            if not ccdListPerTract1:
+            existsRefList1, existsCcdList1 = getDataExistsRefList(dataRefListTract1, repoInfo1.catDataset)
+            existsRefList2, existsCcdList2 = getDataExistsRefList(dataRefListTract2, repoInfo2.catDataset)
+            if not existsCcdList1:
                 raise RuntimeError(f"No datasets found for datasetType = {repoInfo1.catDataset}")
-            if not ccdListPerTract2:
+            if not existsCcdList2:
                 raise RuntimeError(f"No datasets found for datasetType = {repoInfo2.catDataset}")
 
             if self.config.doApplyExternalPhotoCalib1:
-                ccdPhotoCalibListPerTract1 = getDataExistsRefList(dataRefListTract1,
-                                                                  repoInfo1.photoCalibDataset)
+                _, ccdPhotoCalibListPerTract1 = getDataExistsRefList(dataRefListTract1,
+                                                                     repoInfo1.photoCalibDataset)
                 if not ccdPhotoCalibListPerTract1:
                     self.log.fatal(f"No data found for {repoInfo1.photoCalibDataset} dataset...are you "
                                    "sure you ran the external calibration?  If not, run with "
                                    "--config doApplyExternalPhotoCalib1=False")
             if self.config.doApplyExternalPhotoCalib2:
-                ccdPhotoCalibListPerTract2 = getDataExistsRefList(dataRefListTract2,
-                                                                  repoInfo2.photoCalibDataset)
+                _, ccdPhotoCalibListPerTract2 = getDataExistsRefList(dataRefListTract2,
+                                                                     repoInfo2.photoCalibDataset)
                 if not ccdPhotoCalibListPerTract2:
                     self.log.fatal(f"No data found for {repoInfo2.photoCalibDataset} dataset...are you "
                                    "sure you ran the external calibration?  If not, run with "
                                    "--config doApplyExternalPhotoCalib2=False")
             if self.config.doApplyExternalSkyWcs1:
                 # Check for wcs for compatibility with old dataset naming
-                ccdSkyWcsListPerTract1 = getDataExistsRefList(dataRefListTract1, repoInfo1.skyWcsDataset)
+                _, ccdSkyWcsListPerTract1 = getDataExistsRefList(dataRefListTract1, repoInfo1.skyWcsDataset)
                 if not ccdSkyWcsListPerTract1:
-                    ccdSkyWcsListPerTract1 = getDataExistsRefList(dataRefListTract1, "wcs")
+                    _, ccdSkyWcsListPerTract1 = getDataExistsRefList(dataRefListTract1, "wcs")
                     if ccdSkyWcsListPerTract1:
                         repoInfo1.skyWcsDataset = "wcs"
                         self.log.info("Old meas_mosaic dataset naming: wcs (new name is jointcal_wcs)")
@@ -986,9 +1134,9 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                                        "with --config doApplyExternalSkyWcs1=False")
             if self.config.doApplyExternalSkyWcs2:
                 # Check for wcs for compatibility with old dataset naming
-                ccdSkyWcsListPerTract2 = getDataExistsRefList(dataRefListTract2, repoInfo2.skyWcsDataset)
+                _, ccdSkyWcsListPerTract2 = getDataExistsRefList(dataRefListTract2, repoInfo2.skyWcsDataset)
                 if not ccdSkyWcsListPerTract2:
-                    ccdSkyWcsListPerTract2 = getDataExistsRefList(dataRefListTract2, "wcs")
+                    _, ccdSkyWcsListPerTract2 = getDataExistsRefList(dataRefListTract2, "wcs")
                     if ccdSkyWcsListPerTract2:
                         repoInfo2.skyWcsDataset = "wcs"
                         self.log.info("Old meas_mosaic dataset naming: wcs (new name is jointcal_wcs)")
@@ -997,10 +1145,10 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                                        "sure you ran the external astrometric calibration?  If not, run "
                                        "with --config doApplyExternalSkyWcs2=False")
 
-            ccdIntersectList = list(set(ccdListPerTract1).intersection(set(ccdListPerTract2)))
+            ccdIntersectList = list(set(existsCcdList1).intersection(set(existsCcdList2)))
             self.log.info("tract: {:d}".format(repoInfo1.dataId["tract"]))
-            self.log.info(f"ccdListPerTract1: \n{ccdListPerTract1}")
-            self.log.info(f"ccdListPerTract2: \n{ccdListPerTract2}")
+            self.log.info(f"existsCcdList1: \n{existsCcdList1}")
+            self.log.info(f"existsCcdList2: \n{existsCcdList2}")
             self.log.info(f"ccdIntersectList: \n{ccdIntersectList}")
             if self.config.doApplyExternalPhotoCalib1:
                 self.log.info(f"ccdPhotoCalibListPerTract1: \n{ccdPhotoCalibListPerTract1}")
@@ -1024,16 +1172,16 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                                       useMeasMosaic=self.config.useMeasMosaic2, iCat=1)
             if self.config.doReadParquetTables1 or self.config.doReadParquetTables2:
                 if self.config.doReadParquetTables1:
-                    catalog1, commonZpCat1 = self.readParquetTables(dataRefListTract1, repoInfo1.catDataset,
+                    catalog1, commonZpCat1 = self.readParquetTables(existsRefList1, repoInfo1.catDataset,
                                                                     repoInfo1, **externalCalKwargs1)
-                    areaDict1, _ = computeAreaDict(repoInfo1, dataRefListTract1, dataset="", fakeCat=None)
+                    areaDict1, _ = computeAreaDict(repoInfo1, existsRefList1, dataset="", fakeCat=None)
 
                 if self.config.doReadParquetTables2:
-                    catalog2, commonZpCat2 = self.readParquetTables(dataRefListTract2, repoInfo2.catDataset,
+                    catalog2, commonZpCat2 = self.readParquetTables(existsRefList2, repoInfo2.catDataset,
                                                                     repoInfo2, **externalCalKwargs2)
             if not self.config.doReadParquetTables1 or not self.config.doReadParquetTables2:
                 if not self.config.doReadParquetTables1:
-                    catStruct1 = self.readCatalogs(dataRefListTract1, dataset1, repoInfo1,
+                    catStruct1 = self.readCatalogs(existsRefList1, dataset1, repoInfo1,
                                                    aliasDictList=aliasDictList, fakeCat=None,
                                                    readFootprintsAs=self.config.readFootprintsAs,
                                                    **externalCalKwargs1)
@@ -1044,7 +1192,7 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                     commonZpCat1 = commonZpCat1.asAstropy().to_pandas().set_index("id", drop=False)
                     catalog1 = catalog1.asAstropy().to_pandas().set_index("id", drop=False)
                 if not self.config.doReadParquetTables2:
-                    catStruct2 = self.readCatalogs(dataRefListTract2, dataset2, repoInfo2,
+                    catStruct2 = self.readCatalogs(existsRefList2, dataset2, repoInfo2,
                                                    aliasDictList=aliasDictList, fakeCat=None,
                                                    readFootprintsAs=self.config.readFootprintsAs,
                                                    **externalCalKwargs2)
@@ -1086,7 +1234,7 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                           format(self.matchRadius, self.matchRadiusUnitStr, len(catalog),
                                  int(100*len(catalog)/len(catalog1))))
 
-            subdir = "ccd-" + str(ccdListPerTract1[0]) if len(ccdIntersectList) == 1 else subdir
+            subdir = "ccd-" + str(existsCcdList1[0]) if len(ccdIntersectList) == 1 else subdir
             hscRun = repoInfo1.hscRun if repoInfo1.hscRun else repoInfo2.hscRun
             schema = getSchema(catalog)
 
@@ -1100,11 +1248,17 @@ class CompareVisitAnalysisTask(VisitAnalysisTask, CompareCoaddAnalysisTask):
                                zpLabel=self.zpLabel, forcedStr=self.catLabel, highlightList=highlightList)
 
             plotInfoDict = getPlotInfo(repoInfo1)
+            try:
+                rerun2Str = list(repoInfo2.butler.storage.repositoryCfgs)[0]
+            except AttributeError:
+                rootDir = str(repoInfo2.butler.datastore.root)
+                rootDir = rootDir.replace("file://", "")
+                rerun2Str = rootDir + repoInfo2.butler.collections[0]
             plotInfoDict.update({"ccdList": ccdIntersectList, "allCcdList": fullCameraCcdList1,
                                  "plotType": "plotCompareVisit", "subdir": subdir,
                                  "hscRun1": repoInfo1.hscRun, "hscRun2": repoInfo2.hscRun,
                                  "hscRun": hscRun, "tractInfo": tractInfo1, "dataId": repoInfo1.dataId,
-                                 "rerun2": list(repoInfo2.butler.storage.repositoryCfgs)[0]})
+                                 "rerun2": rerun2Str})
             plotList = []
             if self.config.doPlotFootprintArea:
                 plotList.append(self.plotFootprint(catalog, plotInfoDict, areaDict1, **plotKwargs1))

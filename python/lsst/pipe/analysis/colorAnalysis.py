@@ -22,6 +22,8 @@
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FormatStrFormatter
+
+import copy
 import numpy as np
 import pandas as pd
 import functools
@@ -45,6 +47,7 @@ from .utils import (Enforcer, concatenateCatalogs, getFluxKeys, addColumnsToSche
 from .plotUtils import (AllLabeller, plotText, labelCamera, setPtSize, determineExternalCalLabel,
                         getPlotInfo)
 
+import lsst.daf.butler as dafButler
 import lsst.geom as geom
 import lsst.afw.table as afwTable
 import lsst.verify as verify
@@ -52,9 +55,12 @@ import lsst.verify as verify
 matplotlib.use("Agg")
 np.seterr(all="ignore")
 
-__all__ = ["ColorTransform", "ivezicTransformsSDSS", "ivezicTransformsHSC", "straightTransforms",
-           "NumStarLabeller", "ColorValueInFitRange", "ColorValueInPerpRange", "GalaxyColor",
-           "ColorAnalysisConfig", "ColorAnalysisRunner", "ColorAnalysisTask", "ColorColorDistance"]
+__all__ = ["ColorTransform", "NumStarLabeller", "ColorValueInFitRange", "ColorValueInPerpRange",
+           "GalaxyColor", "ColorAnalysisConfig", "ColorAnalysisRunner", "ColorAnalysisTask",
+           "ColorColorDistance"]
+
+filterToBandMap = {"HSC-G": "g", "HSC-R": "r", "HSC-R2": "r", "HSC-I": "i", "HSC-I2": "i",
+                   "HSC-Z": "z", "HSC-Y": "y", "NB0921": "z"}
 
 
 class ColorTransform(Config):
@@ -151,13 +157,56 @@ ivezicTransformsHSC = {
                                       {"HSC-R": 0.40, "HSC-I": -0.40, "": 0.03}),
 }
 
-straightTransforms = {
+tempTransformsImSim = {
+    "wPerp": ColorTransform.fromValues("Temporary w perpendicular", " (griBlue)", True,
+                                       {"g": -0.274, "r": 0.803, "i": -0.529, "": 0.041},
+                                       x0=0.4481, y0=0.1546,
+                                       requireGreater={"wPara": -0.2}, requireLess={"wPara": 0.6},
+                                       fitLineSlope=-1/0.52, fitLineUpperIncpt=2.40, fitLineLowerIncpt=0.68),
+    "xPerp": ColorTransform.fromValues("Temporary x perpendicular", " (griRed)", True,
+                                       {"g": -0.680, "r": 0.731, "i": -0.051, "": 0.792},
+                                       x0=1.2654, y0=1.3675,
+                                       requireGreater={"xPara": 0.8}, requireLess={"xPara": 1.6},
+                                       fitLineSlope=-1/13.35, fitLineUpperIncpt=1.73, fitLineLowerIncpt=0.87),
+    "yPerp": ColorTransform.fromValues("Temporary y perpendicular", " (rizRed)", True,
+                                       {"r": -0.227, "i": 0.793, "HSC-Z": -0.566, "": -0.017},
+                                       x0=1.2219, y0=0.5183,
+                                       requireGreater={"yPara": 0.1}, requireLess={"yPara": 1.2},
+                                       fitLineSlope=-1/0.40, fitLineUpperIncpt=5.5, fitLineLowerIncpt=2.6),
+    # The following still default to the SDSS values.  HSC coeffs will be
+    # derived on a subsequent commit.
+    "wPara": ColorTransform.fromValues("Temporary w parallel", " (griBlue)", False,
+                                       {"g": 0.888, "r": -0.427, "i": -0.461, "": -0.478}),
+    "xPara": ColorTransform.fromValues("Temporary x parallel", " (griRed)", False,
+                                       {"g": 0.075, "r": 0.922, "i": -0.997, "": -1.442}),
+    "yPara": ColorTransform.fromValues("Temporary y parallel", " (rizRed)", False,
+                                       {"r": 0.928, "i": -0.557, "HSC-Z": -0.372, "": -1.332}),
+    # The following three entries were derived in the process of calibrating
+    # the above coeffs (all three RC2 tracts gave effectively the same fits).
+    # May remove later if deemed no longer useful.
+    "wFit": ColorTransform.fromValues("Straight line fit for wPerp range", " (griBlue)", False,
+                                      {"g": 0.52, "r": -0.52, "": -0.08}),
+    "xFit": ColorTransform.fromValues("Straight line fit for xperp range", " (griRed)", False,
+                                      {"g": 13.35, "r": -13.35, "": -15.54}),
+    "yFit": ColorTransform.fromValues("Straight line fit for yPerp range", " (rizRed)", False,
+                                      {"r": 0.40, "i": -0.40, "": 0.03}),
+}
+
+straightTransformsHSC = {
     "g": ColorTransform.fromValues("HSC-G", "", True, {"HSC-G": 1.0}),
     "r": ColorTransform.fromValues("HSC-R", "", True, {"HSC-R": 1.0}),
     "i": ColorTransform.fromValues("HSC-I", "", True, {"HSC-I": 1.0}),
     "z": ColorTransform.fromValues("HSC-Z", "", True, {"HSC-Z": 1.0}),
     "y": ColorTransform.fromValues("HSC-Y", "", True, {"HSC-Y": 1.0}),
     "n921": ColorTransform.fromValues("NB0921", "", True, {"NB0921": 1.0}),
+}
+straightTransforms = {
+    "g": ColorTransform.fromValues("g", "", True, {"g": 1.0}),
+    "r": ColorTransform.fromValues("r", "", True, {"r": 1.0}),
+    "i": ColorTransform.fromValues("i", "", True, {"i": 1.0}),
+    "z": ColorTransform.fromValues("z", "", True, {"z": 1.0}),
+    "y": ColorTransform.fromValues("y", "", True, {"y": 1.0}),
+    "n921": ColorTransform.fromValues("n921", "", True, {"n921": 1.0}),
 }
 
 
@@ -241,6 +290,7 @@ class ColorAnalysisConfig(Config):
                                "modelfit_CModel_flag", "base_PixelFlags_flag_saturatedCenter",
                                "base_ClassificationExtendedness_flag"])
     analysis = ConfigField(dtype=AnalysisConfig, doc="Analysis plotting options")
+    cameraName = Field(dtype=str, default="HSC", doc="Name of camera to select appropriate transforms")
     transforms = ConfigDictField(keytype=str, itemtype=ColorTransform, default={},
                                  doc="Color transformations to analyse")
     fluxFilter = Field(dtype=str, default="HSC-I", doc=("Filter to use for plotting against magnitude and "
@@ -317,12 +367,9 @@ class ColorAnalysisConfig(Config):
 
     def setDefaults(self):
         Config.setDefaults(self)
-        self.transforms = ivezicTransformsHSC
         self.analysis.flags = []  # We remove bad source ourself
         self.analysis.fluxColumn = "base_PsfFlux_instFlux"
         self.analysis.magThreshold = 22.0  # RHL requested this limit
-        if self.correctForGalacticExtinction:
-            self.flags += ["galacticExtinction_flag"]
         self.analysis.doLabelRerun = self.doLabelRerun
 
     def validate(self):
@@ -332,6 +379,15 @@ class ColorAnalysisConfig(Config):
         if self.correctForGalacticExtinction and self.extinctionCoeffs is None:
             raise ValueError("Must set appropriate extinctionCoeffs config.  See "
                              "config/hsc/extinctionCoeffs.py in obs_subaru for an example.")
+        if self.correctForGalacticExtinction:
+            self.flags += ["galacticExtinction_flag"]
+
+        if self.cameraName == "HSC":
+            self.transforms = ivezicTransformsHSC
+        elif self.cameraName == "LSSTCam-imSim":
+            self.transforms = tempTransformsImSim
+        else:
+            self.transforms = straightTransforms
 
         # If a wired origin was included in the config, check that it actually
         # lies on the wired P1 line (allowing for round-off error for precision
@@ -356,43 +412,118 @@ class ColorAnalysisRunner(TaskRunner):
     @staticmethod
     def getTargetList(parsedCmd, **kwargs):
         kwargs["subdir"] = parsedCmd.subdir
+
+        idParser = parsedCmd.id.__class__(parsedCmd.id.level)
+        idParser.idList = parsedCmd.id.idList
+        idParser.datasetType = parsedCmd.id.datasetType
+        idParser.makeDataRefList(parsedCmd)
+
         dataset = "obj" if parsedCmd.config.doReadParquetTables else "forced_src"
         FilterRefsDict = functools.partial(defaultdict, list)  # Dict for filter-->dataRefs
         tractFilterRefs = defaultdict(FilterRefsDict)  # tract-->filter-->dataRefs
-        for patchRef in sum(parsedCmd.id.refList, []):
-            # Make sure the actual input file requested exists (i.e. do not
-            # follow the parent chain).
-            inputDataFile = patchRef.get(parsedCmd.config.coaddName + "Coadd_" + dataset + "_filename")[0]
-            if parsedCmd.input not in parsedCmd.output:
-                inputDataFile = inputDataFile.replace(parsedCmd.output, parsedCmd.input)
-            if os.path.exists(inputDataFile):
-                tract = patchRef.dataId["tract"]
-                filterName = patchRef.dataId["filter"]
-                tractFilterRefs[tract][filterName].append(patchRef)
+
+        if parsedCmd.collection is not None:
+            repoRootDir = "/repo/dc2" if parsedCmd.instrument == "LSSTCam-imSim" else "/repo/main"
+            if parsedCmd.instrument is None:
+                raise RuntimeError("Must provide --instrument command line option for gen3 repos.")
+            butlerGen3 = dafButler.Butler(repoRootDir, collections=parsedCmd.collection,
+                                          instrument=parsedCmd.instrument)
+            butlerGen2 = parsedCmd.butler
+            parsedCmd.butler = butlerGen3
+            kwargs["butlerGen2"] = butlerGen2
+
+            tract = parsedCmd.id.refList[0][0].dataId["tract"]
+            skyMap = butlerGen3.get("skyMap")
+            tractInfo = skyMap.generateTract(tract)
+            # Create a mapping from N,N patchId of Gen2 to integer id of Gen3
+            patchIdToGen3Map = {}
+            for patch in tractInfo:
+                patchIndexStr = str(patch.getIndex()[0]) + "," + str(patch.getIndex()[1])
+                patchIdToGen3Map[patchIndexStr] = tractInfo.getSequentialPatchIndex(patch)
+            kwargs["patchIdToGen3Map"] = patchIdToGen3Map
+
+            patchList = []
+            filterList = []
+            for pId in parsedCmd.id.refList[0]:
+                patchList.append(pId.dataId["patch"])
+                filterList.append(pId.dataId["filter"])
+            filterList = set(filterList)
+            gen3PidList = idParser.idList.copy()
+
+            if len(gen3PidList) < len(patchList):
+                gen3PidList = gen3PidList*len(patchList)
+            # Using patchId for the gen2 N,N naming scheme and just patch for
+            # the gen3 numerical equivalent.
+            for physical_filter in filterList:
+                gen3RefList = []
+                for gen3Pid, patchId in zip(gen3PidList, patchList):
+                    if gen3Pid["filter"] == physical_filter:
+                        gen3PidCopy = copy.deepcopy(gen3Pid)
+                        if "filter" in gen3PidCopy:
+                            gen3PidCopy["physical_filter"] = gen3PidCopy["filter"]
+                            physical_filter = gen3PidCopy["physical_filter"]
+                            if parsedCmd.instrument == "HSC":
+                                gen3PidCopy["band"] = filterToBandMap[gen3PidCopy["physical_filter"]]
+                                gen3PidCopy["skymap"] = "hsc_rings_v1"
+                            else:
+                                gen3PidCopy["band"] = gen3PidCopy["physical_filter"]
+                                gen3PidCopy["skymap"] = "DC2"
+                            gen3PidCopy["dataId"] = gen3PidCopy.copy()
+                            gen3PidCopy["butler"] = butlerGen3
+                        gen3PidCopy["patchId"] = patchId
+                        gen3PidCopy["patch"] = patchIdToGen3Map[patchId]
+                        gen3PidCopy["dataId"]["patch"] = patchIdToGen3Map[patchId]
+                        gen3PidCopy["dataId"]["patchId"] = patchId
+                        gen3PidCopy["camera"] = parsedCmd.instrument
+                        gen3RefList.append(gen3PidCopy)
+                        tractFilterRefs[tract][physical_filter] = gen3RefList
+        else:
+            for patchRef in sum(parsedCmd.id.refList, []):
+                # Make sure the actual input file requested exists (i.e. do not
+                # follow the parent chain).
+                inputDataFile = patchRef.get(parsedCmd.config.coaddName + "Coadd_" + dataset + "_filename")[0]
+                if parsedCmd.input not in parsedCmd.output:
+                    inputDataFile = inputDataFile.replace(parsedCmd.output, parsedCmd.input)
+                if os.path.exists(inputDataFile):
+                    tract = patchRef.dataId["tract"]
+                    filterName = patchRef.dataId["filter"]
+                    tractFilterRefs[tract][filterName].append(patchRef)
 
         # Find tract,patch with full colour coverage (makes combining catalogs
         # easier).
         bad = []
         for tract in tractFilterRefs:
             filterRefs = tractFilterRefs[tract]
-            patchesForFilters = [set(patchRef.dataId["patch"] for patchRef in patchRefList) for
-                                 patchRefList in filterRefs.values()]
+            if parsedCmd.collection is not None:
+                patchesForFilters = [set(patchRef["dataId"]["patch"] for patchRef in patchRefList) for
+                                     patchRefList in filterRefs.values()]
+            else:
+                patchesForFilters = [set(patchRef.dataId["patch"] for patchRef in patchRefList) for
+                                     patchRefList in filterRefs.values()]
             if not patchesForFilters:
                 parsedCmd.log.warn("No input data found for tract {:d}".format(tract))
                 bad.append(tract)
                 continue
             keep = set.intersection(*patchesForFilters)  # Patches with full colour coverage
-            tractFilterRefs[tract] = {
-                filterName: [patchRef for patchRef in filterRefs[filterName]
-                             if patchRef.dataId["patch"] in keep] for filterName in filterRefs}
+
+            if parsedCmd.collection is not None:
+                tractFilterRefs[tract] = {
+                    filterName: [patchRef for patchRef in filterRefs[filterName]
+                                 if patchRef["dataId"]["patch"] in keep] for filterName in filterRefs}
+            else:
+                tractFilterRefs[tract] = {
+                    filterName: [patchRef for patchRef in filterRefs[filterName]
+                                 if patchRef.dataId["patch"] in keep] for filterName in filterRefs}
+
         for tract in bad:
             del tractFilterRefs[tract]
 
         # List of filters included on the command line
         parsedFilterList = [dataId["filter"] for dataId in parsedCmd.id.idList]
+
         for tract in tractFilterRefs:
             numFilters = 0
-            for filterName in parsedFilterList:
+            for filterName in set(parsedFilterList):
                 if filterName in tractFilterRefs[tract].keys():
                     numFilters += 1
                 else:
@@ -401,7 +532,7 @@ class ColorAnalysisRunner(TaskRunner):
             if numFilters < 3:
                 parsedCmd.log.warn("Must have at least 3 filters with data existing in the input repo. "
                                    "Only {0:d} exist of those requested ({1:}) for tract {2:d}. "
-                                   "Skipping tract.".format(numFilters, parsedFilterList, tract))
+                                   "Skipping tract.".format(numFilters, set(parsedFilterList), tract))
                 del tractFilterRefs[tract]
             if not tractFilterRefs[tract]:
                 raise RuntimeError("No suitable datasets found.")
@@ -418,6 +549,18 @@ class ColorAnalysisTask(CmdLineTask):
     @classmethod
     def _makeArgumentParser(cls):
         parser = ArgumentParser(name=cls._DefaultName)
+        parser.add_argument("--collection", required=False, default=None,
+                            help="Collection for rerun if it is Gen3.  NOTE: must still point to a gen2 "
+                            "input to get a valid parsed data reference list and a gen2-stlye rerun for "
+                            "plot persistence.  E.g. "
+                            "/datasets/hsc/repo/ --rerun RC/w_2021_NN/DM-NNNNN:private/username/outDir "
+                            "--collection HSC/runs/RC2/w_2021_NN/DM-NNNNN --instrument HSC or "
+                            "/datasets/DC2/repoRun2.2i "
+                            "--rerun w_2021_NN/DM-NNNNN/multi:private/username/outDir "
+                            " --collection 2.2i/runs/test-med-1/w_2021_NN/DM-NNNNN "
+                            "--instrument LSSTCam-imSim")
+        parser.add_argument("--instrument", required=False, default=None,
+                            help="Instrument for run if it is Gen3")
         parser.add_id_argument("--id", "deepCoadd_forced_src",
                                help="data ID, e.g. --id tract=12345 patch=1,2 filter=HSC-X",
                                ContainerClass=TractDataIdContainer)
@@ -433,12 +576,15 @@ class ColorAnalysisTask(CmdLineTask):
 
         self.verifyJob = verify.Job.load_metrics_package(subset="pipe_analysis")
 
-    def runDataRef(self, patchRefsByFilter, subdir=""):
+    def runDataRef(self, patchRefsByFilter, subdir="", butlerGen2=None, patchIdToGen3Map=None):
         patchList = []
-        repoInfo = None
+        patchIdList = []
         self.fullFilterList = list(patchRefsByFilter.keys())
-        self.fullBandList = [self.config.physicalToBandFilterMap[physicalFilter]
-                             for physicalFilter in self.fullFilterList]
+        if self.fullFilterList[0] in self.config.physicalToBandFilterMap:
+            self.fullBandList = [self.config.physicalToBandFilterMap[physicalFilter]
+                                 for physicalFilter in self.fullFilterList]
+        else:
+            self.fullBandList = self.fullFilterList
         dataset = "Coadd_obj" if self.config.doReadParquetTables else "Coadd_forced_src"
         if (not set(self.config.minimalFluxList).intersection(set(self.fullFilterList))
                 == set(self.config.minimalFluxList)
@@ -456,15 +602,51 @@ class ColorAnalysisTask(CmdLineTask):
                             "List provided was: {2:})".
                             format(self.config.fluxFilter, self.config.fluxFilterGeneric,
                                    list(patchRefsByFilter.keys())))
-        self.log.info("Flux filter for plotting and primary star/galaxy classifiation is: {0:s}".
+        self.log.info("Flux filter for plotting and primary star/galaxy classification is: {0:s}".
                       format(self.fluxFilter))
+        # Find the first patch for which data exists to use as template for
+        # getRepoInfo.
+        patchRefTemplate = None
+        for patchRef in patchRefsByFilter[self.fluxFilter]:
+            if patchRefTemplate is not None:
+                break
+            if hasattr(patchRef, "getButler"):
+                butler = patchRef.getButler()
+                try:
+                    butler.getUri("deepCoadd_calexp", patchRef.dataId)
+                    patchRefTemplate = patchRef
+                    break
+                except LookupError:
+                    pass
+            else:
+                butler = patchRef["butler"]
+                try:
+                    butler.getURI("deepCoadd_calexp", patchRef["dataId"])
+                    patchRefTemplate = patchRef
+                    break
+                except LookupError:
+                    pass
+
+        if patchRefTemplate is None:
+            raise RuntimeError("No patch with data found for required filter {}".format(self.fluxFilter))
+        repoInfo = getRepoInfo(patchRefTemplate, coaddName=self.config.coaddName, coaddDataset=dataset)
+
         for patchRefList in patchRefsByFilter.values():
             for dataRef in patchRefList:
-                if (dataRef.dataId["filter"] == self.fluxFilter
-                        and dataRef.datasetExists(self.config.coaddName + dataset)):
-                    patchList.append(dataRef.dataId["patch"])
-                    if repoInfo is None:
-                        repoInfo = getRepoInfo(dataRef, coaddName=self.config.coaddName, coaddDataset=dataset)
+                if not repoInfo.isGen3:
+                    dataRef.dataId["patchId"] = dataRef.dataId["patch"]
+                    if (dataRef.dataId["filter"] == self.fluxFilter
+                            and dataRef.datasetExists(self.config.coaddName + dataset)):
+                        patchList.append(dataRef.dataId["patch"])
+                        patchIdList.append(dataRef.dataId["patch"])
+                else:
+                    if dataRef["dataId"]["filter"] == self.fluxFilter:
+                        try:
+                            repoInfo.butler.getURI(self.config.coaddName + dataset, dataRef["dataId"])
+                            patchList.append(dataRef["dataId"]["patch"])
+                            patchIdList.append(dataRef["dataId"]["patchId"])
+                        except LookupError:
+                            self.log.info("No gen3 dataset found for {}".format(dataRef["dataId"]))
         if len(patchList) > 0:
             self.log.info("Size of patchList with at least partial coverage: {0:}".format(len(patchList)))
         else:
@@ -491,24 +673,37 @@ class ColorAnalysisTask(CmdLineTask):
         for (filterName, patchRefList) in patchRefsByFilter.items():
             if self.config.doReadParquetTables:
                 dfDataset = "forced_src"
-                cat = self.readParquetTables(patchRefList, self.config.coaddName + dataset, filterName,
-                                             repoInfo, dfDataset=dfDataset)
-                fullCoveragePatchList = list(set(cat["patchId"].values))
+                cat = self.readParquetTables(patchRefList, patchList, self.config.coaddName + dataset,
+                                             filterName, repoInfo, dfDataset=dfDataset)
+                fullCoveragePatchList = list(set(cat["patchId"]))
+                if repoInfo.isGen3:
+                    for ip, patch in enumerate(fullCoveragePatchList):
+                        patchId = list(patchIdToGen3Map.keys())[list(patchIdToGen3Map.values()).index(patch)]
+                        fullCoveragePatchList[ip] = patchId
                 if len(fullCoveragePatchRefList) == 0:
                     for patchRef in patchRefList:
-                        if patchRef.dataId["patch"] in fullCoveragePatchList:
+                        dataId = patchRef["dataId"] if repoInfo.isGen3 else patchRef.dataId
+                        if dataId["patchId"] in fullCoveragePatchList:
                             fullCoveragePatchRefList.append(patchRef)
+
                 areaDict, _ = computeAreaDict(repoInfo, fullCoveragePatchRefList,
                                               dataset=self.config.coaddName + "Coadd", fakeCat=None)
             else:
                 cat, areaDict = self.readCatalogs(patchRefList, self.config.coaddName + dataset, repoInfo)
                 # Convert to pandas DataFrames
                 cat = cat.asAstropy().to_pandas().set_index("id", drop=False)
+                cat = cat.sort_index()
+                numDupes = sum(cat.index.duplicated())
+                if numDupes > 0:
+                    self.log.warn("There were {} duplicate id entries...deduplicating catalog".
+                                  format(numDupes))
+                    cat = cat.loc[~cat.index.duplicated(), :]
                 cat = calibrateSourceCatalog(cat, self.config.analysis.coaddZp)
                 fullCoveragePatchList = list(set(cat["patchId"].values))
                 if len(fullCoveragePatchRefList) == 0:
                     for patchRef in patchRefList:
-                        if patchRef.dataId["patch"] in fullCoveragePatchList:
+                        dataId = patchRef["dataId"] if repoInfo.isGen3 else patchRef.dataId
+                        if dataId["patchId"] in fullCoveragePatchList:
                             fullCoveragePatchRefList.append(patchRef)
             byFilterForcedCats[filterName] = cat
             byFilterAreaDict[filterName] = areaDict
@@ -516,7 +711,7 @@ class ColorAnalysisTask(CmdLineTask):
         self.forcedStr = "forced"
         geLabel = "None"
         doPlotGalacticExtinction = False
-        if self.correctForGalacticExtinction:
+        if self.config.correctForGalacticExtinction:
             # The per-object Galactic Extinction correction currently requires
             # sims_catUtils to be setup as it uses the EBVbase class to obtain
             # E(B-V).  Putting this in a try/except to fall back to the
@@ -532,7 +727,8 @@ class ColorAnalysisTask(CmdLineTask):
                 geLabel = "Per Field"
 
         plotInfoDict = getPlotInfo(repoInfo)
-        plotInfoDict.update(dict(patchList=fullCoveragePatchList, plotType="plotColor", subdir=subdir,
+        plotInfoDict.update(dict(patchList=fullCoveragePatchList, patchIdList=fullCoveragePatchList,
+                                 plotType="plotColor", subdir=subdir,
                                  hscRun=repoInfo.hscRun, tractInfo=repoInfo.tractInfo,
                                  dataId=repoInfo.dataId))
 
@@ -548,7 +744,10 @@ class ColorAnalysisTask(CmdLineTask):
                                                         "modelfit_CModel_instFlux", hscRun=repoInfo.hscRun)
         # Create and write parquet tables
         if self.config.doWriteParquetTables:
-            dataRef_color = repoInfo.butler.dataRef("analysisColorTable", dataId=repoInfo.dataId)
+            if repoInfo.isGen3:
+                dataRef_color = butlerGen2.dataRef("analysisColorTable", dataId=repoInfo.dataId)
+            else:
+                dataRef_color = repoInfo.butler.dataRef("analysisColorTable", dataId=repoInfo.dataId)
             writeParquet(dataRef_color, principalColCatsPsf)
             if self.config.writeParquetOnly:
                 self.log.info("Exiting after writing Parquet tables.  No plots generated.")
@@ -572,9 +771,12 @@ class ColorAnalysisTask(CmdLineTask):
             plotList.append(self.plotStarColorColor(principalColCats, byFilterForcedCats, plotInfoDict,
                                                     byFilterAreaDict, fluxColumn, forcedStr=self.forcedStr,
                                                     geLabel=geLabel, uberCalLabel=uberCalLabel))
-
-        self.allStats, self.allStatsHigh = savePlots(plotList, "plotColor", repoInfo.dataId,
-                                                     repoInfo.butler, subdir=subdir)
+        if repoInfo.isGen3:
+            self.allStats, self.allStatsHigh = savePlots(plotList, "plotColor", repoInfo.dataId,
+                                                         butlerGen2, subdir=subdir)
+        else:
+            self.allStats, self.allStatsHigh = savePlots(plotList, "plotColor", repoInfo.dataId,
+                                                         repoInfo.butler, subdir=subdir)
 
         # Update the verifyJob with relevant metadata
         metaDict = {"tract": int(plotInfoDict["tract"])}
@@ -585,11 +787,14 @@ class ColorAnalysisTask(CmdLineTask):
         self.verifyJob = updateVerifyJob(self.verifyJob, metaDict=metaDict)
         # TODO: this should become a proper butler.put once we can persist the
         # json files (possibly DM-14768).
-        verifyJobFilename = repoInfo.butler.get("colorAnalysis_verify_job_filename",
-                                                dataId=repoInfo.dataId)[0]
+        if repoInfo.isGen3:
+            verifyJobFilename = butlerGen2.get("colorAnalysis_verify_job_filename", dataId=repoInfo.dataId)[0]
+        else:
+            verifyJobFilename = repoInfo.butler.get("colorAnalysis_verify_job_filename",
+                                                    dataId=repoInfo.dataId)[0]
         self.verifyJob.write(verifyJobFilename)
 
-    def readParquetTables(self, dataRefList, dataset, filterName, repoInfo, dfDataset=None):
+    def readParquetTables(self, dataRefList, dataIdExistsList, dataset, filterName, repoInfo, dfDataset=None):
         """Read in, calibrate, and concatenate parquet tables from a list of
         dataRefs.
 
@@ -604,6 +809,9 @@ class ColorAnalysisTask(CmdLineTask):
                       `lsst.daf.persistence.butlerSubset.ButlerDataRef`
             A list of butler data references whose catalogs of ``dataset``
             are to be read in.
+        dataIdExistsList : `list` of `int` or `str`
+            A list of the dataIds (patches) for which data exists in at
+            least the self.fluxFilter band.
         dataset : `str`
             Name of the catalog ``dataset`` to be read in, e.g.
             "deepCoadd_obj" (for coadds) or "source" (for visits).
@@ -642,32 +850,45 @@ class ColorAnalysisTask(CmdLineTask):
         refColsToLoadList = None
         measColsToLoadList = None
         for dataRef in dataRefList:
-            if not dataRef.datasetExists(dataset):
-                self.log.info("Dataset does not exist: {0:r}, {1:s}".format(dataRef.dataId, dataset))
+            dataId = dataRef["dataId"] if repoInfo.isGen3 else dataRef.dataId
+            if dataId["patch"] not in dataIdExistsList:
+                self.log.info("No data found for {}.  Skipping...".format(dataId))
                 continue
-            parquetCat = dataRef.get(dataset, immediate=True)
+            if not repoInfo.isGen3:
+                parquetCat = dataRef.get(dataset, immediate=True)
+            else:
+                parquetCat = repoInfo.butler.get(dataset, dataId=dataId, immediate=True)
             # Some obj tables do not contain data for all filters
-            if isinstance(parquetCat, parquetTable.MultilevelParquetTable):
-                if not any(dfDataset == dfName for dfName in ["forced_src", "meas", "ref"]):
-                    raise RuntimeError("Must specify a dfDataset for multilevel parquet tables")
+            if not any(dfDataset == dfName for dfName in ["forced_src", "meas", "ref"]):
+                raise RuntimeError("Must specify a dfDataset for multilevel parquet tables")
+            bandName = dataId["band"] if repoInfo.isGen3 else dataId["filter"]
+            filterLevelStr = "band"
+
+            if isinstance(parquetCat.columns, pd.MultiIndex):
+                existsBandList = parquetCat.columns.levels[1]
+            elif isinstance(parquetCat, parquetTable.MultilevelParquetTable):
+                try:
+                    existsBandList = parquetCat.columnLevelNames["band"]
+                    filterLevelStr = "band"
+                    bandName = self.config.physicalToBandFilterMap[filterName]
+                except KeyError:
+                    existsBandList = parquetCat.columnLevelNames["filter"]
+                    filterLevelStr = "filter"
+                    bandName = filterName
+                    self.fullBandList = self.fullFilterList
+            else:
+                existsBandList = None
+            if not (np.all([band in existsBandList for band in self.fullBandList])):
+                if dataId["patch"] not in self.skipPatchList:
+                    self.skipPatchList.append(dataId["patch"])
+                    self.log.info("Full band list requested {0:}\nnot in patch: {1:} "
+                                  "(it only has {2}).  Skipping... ".format(
+                                      self.fullBandList, dataId["patch"], existsBandList))
                 else:
-                    try:
-                        existsBandList = parquetCat.columnLevelNames["band"]
-                        filterLevelStr = "band"
-                        bandName = self.config.physicalToBandFilterMap[filterName]
-                    except KeyError:
-                        existsBandList = parquetCat.columnLevelNames["filter"]
-                        filterLevelStr = "filter"
-                        bandName = filterName
-                        self.fullBandList = self.fullFilterList
-                    if not (np.all([band in existsBandList for band in self.fullBandList])):
-                        if dataRef.dataId["patch"] not in self.skipPatchList:
-                            self.skipPatchList.append(dataRef.dataId["patch"])
-                            self.log.info("Full band list requested {0:}\nnot in patch: {1:} "
-                                          "(it only has {2}).  Skipping... ".format(
-                                              self.fullBandList, dataRef.dataId["patch"], existsBandList))
-                        continue
-            if dfLoadColumns is None and isinstance(parquetCat, parquetTable.MultilevelParquetTable):
+                    continue
+                continue
+
+            if dfLoadColumns is None:
                 dfLoadColumns = {"dataset": dfDataset, filterLevelStr: bandName}
             # On the first dataRef read in, create list of columns to load
             # based on config lists and their existence in the catalog
@@ -681,30 +902,51 @@ class ColorAnalysisTask(CmdLineTask):
                     dfLoadColumns = colsToLoadList
                 else:
                     dfLoadColumns.update(column=colsToLoadList)
-            cat = parquetCat.toDataFrame(columns=dfLoadColumns)
-            cat = addElementIdColumn(cat, dataRef.dataId, repoInfo=repoInfo)
+            if hasattr(parquetCat, "toDataFrame"):
+                cat = parquetCat.toDataFrame(columns=dfLoadColumns)
+            else:
+                parametersDict = {"columns": dfLoadColumns}
+                cat = repoInfo.butler.get(dataset, dataId=dataId, parameters=parametersDict)
+                cat = cat[dfDataset][bandName]
+
+            cat = addElementIdColumn(cat, dataId, repoInfo=repoInfo)
             if dfDataset == "forced_src":  # insert some columns from the ref and meas cats for forced cats
                 if refColsToLoadList is None:
                     refColumns = getParquetColumnsList(parquetCat, dfDataset="ref", filterName=bandName)
                     refColsToLoadList = [col for col in refColumns if
                                          (col.startswith(tuple(self.config.columnsToCopyFromRef))
                                           and not any(s in col for s in self.config.notInColStrList))]
-                ref = parquetCat.toDataFrame(columns={"dataset": "ref", filterLevelStr: bandName,
-                                                      "column": refColsToLoadList})
+                refLoadDict = {"dataset": "ref", filterLevelStr: bandName, "column": refColsToLoadList}
+                if hasattr(parquetCat, "toDataFrame"):
+                    ref = parquetCat.toDataFrame(refLoadDict)
+                else:
+                    parametersDict = {"columns": refLoadDict}
+                    ref = repoInfo.butler.get(dataset, dataId=dataId, parameters=parametersDict)
+                    ref = ref["ref"][bandName]
                 cat = pd.concat([cat, ref], axis=1)
                 if measColsToLoadList is None:
                     measColumns = getParquetColumnsList(parquetCat, dfDataset="meas", filterName=bandName)
                     measColsToLoadList = [col for col in measColumns if
                                           (col.startswith(tuple(self.config.columnsToCopyFromMeas))
                                            and not any(s in col for s in self.config.notInColStrList))]
-                meas = parquetCat.toDataFrame(columns={"dataset": "meas", filterLevelStr: bandName,
-                                                       "column": measColsToLoadList})
+                measLoadDict = {"dataset": "meas", filterLevelStr: bandName, "column": measColsToLoadList}
+                if hasattr(parquetCat, "toDataFrame"):
+                    meas = parquetCat.toDataFrame(measLoadDict)
+                else:
+                    parametersDict = {"columns": measLoadDict}
+                    meas = repoInfo.butler.get(dataset, dataId=dataId, parameters=parametersDict)
+                    meas = meas["meas"][bandName]
+
                 cat = pd.concat([cat, meas], axis=1)
             cat = calibrateSourceCatalog(cat, self.config.analysis.coaddZp)
             catList.append(cat)
 
         if not catList:
-            raise TaskError("No catalogs read: %s" % ([dataRef.dataId for dataRef in dataRefList]))
+            if not repoInfo.isGen3:
+                raise TaskError("No catalogs read: %s" % ([dataRef.dataId for dataRef in dataRefList]))
+            else:
+                raise TaskError("No catalogs read: %s" % ([dataRef["dataId"] for dataRef in dataRefList]))
+
         allCats = pd.concat(catList, axis=0)
         # The object "id" is associated with the dataframe index.  Add a
         # column that is the id so that it is available for operations on it,
@@ -729,6 +971,11 @@ class ColorAnalysisTask(CmdLineTask):
             type are to be read in.
         dataset : `str`
             Name of the catalog ``dataset`` to be read in.
+        repoInfo : `lsst.pipe.base.struct.Struct`
+            A struct containing elements with repo information needed to
+            determine if the catalog data is coadd or visit level and, if the
+            latter, to create appropriate dataIds to look for the external
+            calibration datasets.
 
         Raises
         ------
@@ -746,16 +993,35 @@ class ColorAnalysisTask(CmdLineTask):
         catList = []
         patchRefExistsList = []
         for patchRef in patchRefList:
-            if patchRef.datasetExists(dataset):
-                patchRefExistsList.append(patchRef)
+            if not repoInfo.isGen3:
+                if patchRef.datasetExists(dataset):
+                    patchRefExistsList.append(patchRef)
+            else:
+                try:
+                    patchRef["butler"].getURI(dataset, dataId=patchRef["dataId"])
+                    patchRefExistsList.append(patchRef)
+                except LookupError:
+                    print("No URI for ", patchRef["dataId"])
+
         calexpPrefix = dataset[:dataset.find("_")] if "_" in dataset else ""
         areaDict, _ = computeAreaDict(repoInfo, patchRefExistsList, dataset=calexpPrefix)
+
         for patchRef in patchRefExistsList:
-            cat = patchRef.get(dataset, immediate=True, flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
+            dataId = patchRef["dataId"] if repoInfo.isGen3 else patchRef.dataId
+            if not repoInfo.isGen3:
+                cat = patchRef.get(dataset, immediate=True, flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
+            else:
+                butler = patchRef["butler"]
+                cat = butler.get(dataset, dataId=dataId, immediate=True,
+                                 flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
             schema = getSchema(cat)
             if dataset != self.config.coaddName + "Coadd_meas":
-                refCat = patchRef.get(self.config.coaddName + "Coadd_ref", immediate=True,
-                                      flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
+                if not repoInfo.isGen3:
+                    refCat = patchRef.get(self.config.coaddName + "Coadd_ref", immediate=True,
+                                          flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
+                else:
+                    refCat = butler.get(self.config.coaddName + "Coadd_ref", dataId=dataId, immediate=True,
+                                        flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
                 refCatSchema = getSchema(refCat)
                 refColList = []
                 for strPrefix in self.config.columnsToCopyFromRef:
@@ -764,8 +1030,12 @@ class ColorAnalysisTask(CmdLineTask):
                                  and not any(s in col for s in self.config.notInColStrList)
                                  and col in refCatSchema]
                 cat = addColumnsToSchema(refCat, cat, refColsToCopy)
-                measCat = patchRef.get(self.config.coaddName + "Coadd_meas", immediate=True,
-                                       flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
+                if not repoInfo.isGen3:
+                    measCat = patchRef.get(self.config.coaddName + "Coadd_meas", immediate=True,
+                                           flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
+                else:
+                    measCat = butler.get(self.config.coaddName + "Coadd_meas", dataId=dataId, immediate=True,
+                                         flags=afwTable.SOURCE_IO_NO_HEAVY_FOOTPRINTS)
                 measCatSchema = getSchema(measCat)
                 measColList = []
                 for strPrefix in self.config.columnsToCopyFromMeas:
@@ -776,7 +1046,7 @@ class ColorAnalysisTask(CmdLineTask):
                 cat = addColumnsToSchema(measCat, cat, measColsToCopy)
 
             if self.config.doWriteParquetTables:
-                cat = addIntFloatOrStrColumn(cat, patchRef.dataId["patch"], "patchId",
+                cat = addIntFloatOrStrColumn(cat, dataId["patchId"], "patchId",
                                              "Patch on which source was detected")
             catList.append(cat)
         if not catList:
@@ -1112,12 +1382,18 @@ class ColorAnalysisTask(CmdLineTask):
         for col, transform in self.config.transforms.items():
             if not transform.plot or col not in schema:
                 continue
-            if self.config.transforms == ivezicTransformsHSC:
+            if self.config.transforms == ivezicTransformsHSC or self.config.transforms == tempTransformsImSim:
                 if col == "wPerp" or col == "xPerp":
-                    colStr1, colStr2, colStr3 = "HSC-G", "HSC-R", "HSC-I"
+                    if self.config.transforms == ivezicTransformsHSC:
+                        colStr1, colStr2, colStr3 = "HSC-G", "HSC-R", "HSC-I"
+                    else:
+                        colStr1, colStr2, colStr3 = "g", "r", "i"
                     filterStrList = ["g", "r", "i", ""]
                 elif col == "yPerp":
-                    colStr1, colStr2, colStr3 = "HSC-R", "HSC-I", "HSC-Z"
+                    if self.config.transforms == ivezicTransformsHSC:
+                        colStr1, colStr2, colStr3 = "HSC-R", "HSC-I", "HSC-Z"
+                    else:
+                        colStr1, colStr2, colStr3 = "r", "i", "z"
                     filterStrList = ["r", "i", "z", ""]
                 else:
                     raise RuntimeError("Unknown transformation name: {:s}.  Either set transform.plot "
@@ -1161,7 +1437,7 @@ class ColorAnalysisTask(CmdLineTask):
                     uberCalLabel=uberCalLabel)
 
             # Plot selections of stars for different criteria
-            if self.config.transforms == ivezicTransformsHSC:
+            if self.config.transforms == ivezicTransformsHSC or self.config.transforms == tempTransformsImSim:
                 description = filtersStr + fluxToPlotString("base_PsfFlux_instFlux")
                 qaGood = np.logical_and(np.logical_not(principalColCats["qaBad_flag"]),
                                         principalColCats["numStarFlags"] >= 3)
@@ -1332,7 +1608,11 @@ class ColorAnalysisTask(CmdLineTask):
 
         # The combined catalog is only used in the Distance (from the poly fit)
         # AnalysisClass plots.
-        combined = (self.transformCatalogs(byFilterCats, straightTransforms, "base_PsfFlux_instFlux",
+        if self.config.cameraName == "HSC":
+            combTransforms = straightTransformsHSC
+        else:
+            combTransforms = straightTransforms
+        combined = (self.transformCatalogs(byFilterCats, combTransforms, "base_PsfFlux_instFlux",
                                            hscRun=plotInfoDict["hscRun"])[goodCombined].copy(True))
         filters = set(byFilterCats.keys())
         goodMags = {filterName: mags[filterName][good] for filterName in byFilterCats}
@@ -1341,6 +1621,11 @@ class ColorAnalysisTask(CmdLineTask):
         unitStr = "mmag" if self.config.toMilli else "mag"
         fluxColStr = fluxToPlotString(fluxColumn)
 
+        if self.config.transforms == ivezicTransformsHSC:
+            colStrList = ["HSC-G", "HSC-R", "HSC-I", "HSC-Z", "HSC-Y", "NB0921"]
+        else:
+            colStrList = ["g", "r", "i", "z", "y", "n921"]
+
         polyFitKwargs = dict(thresholdStr=thresholdStr, catLabel=catLabel, geLabel=geLabel,
                              uberCalLabel=uberCalLabel, unitScale=self.unitScale,
                              doLabelRerun=self.config.doLabelRerun)
@@ -1348,7 +1633,8 @@ class ColorAnalysisTask(CmdLineTask):
                                 uberCalLabel=uberCalLabel, unitScale=self.unitScale,
                                 doLabelRerun=self.config.doLabelRerun)
 
-        if filters.issuperset(set(("HSC-G", "HSC-R", "HSC-I"))):
+        # gri
+        if filters.issuperset(set((colStrList[0], colStrList[1], colStrList[2]))):
             # Do a linear fit to regions defined in Ivezic transforms
             transformPerp = self.config.transforms["wPerp"]
             transformPara = self.config.transforms["wPara"]
@@ -1366,8 +1652,8 @@ class ColorAnalysisTask(CmdLineTask):
             else:
                 verifyKwargs = {}
             yield from colorColorPolyFitPlot(plotInfoDict, nameStr,
-                                             self.log, catColors("HSC-G", "HSC-R", mags, good),
-                                             catColors("HSC-R", "HSC-I", mags, good),
+                                             self.log, catColors(colStrList[0], colStrList[1], mags, good),
+                                             catColors(colStrList[1], colStrList[2], mags, good),
                                              "g - r  [{0:s}]".format(fluxColStr),
                                              "r - i  [{0:s}]".format(fluxColStr), self.fluxFilter,
                                              transformPerp=transformPerp, transformPara=transformPara,
@@ -1384,8 +1670,8 @@ class ColorAnalysisTask(CmdLineTask):
             if verifyKwargs:
                 verifyKwargs.update({"verifyMetricName": "stellar_locus_width_xPerp"})
             yield from colorColorPolyFitPlot(plotInfoDict, nameStr,
-                                             self.log, catColors("HSC-G", "HSC-R", mags, good),
-                                             catColors("HSC-R", "HSC-I", mags, good),
+                                             self.log, catColors(colStrList[0], colStrList[1], mags, good),
+                                             catColors(colStrList[1], colStrList[2], mags, good),
                                              "g - r  [{0:s}]".format(fluxColStr),
                                              "r - i  [{0:s}]".format(fluxColStr), self.fluxFilter,
                                              transformPerp=transformPerp, transformPara=transformPara,
@@ -1400,9 +1686,9 @@ class ColorAnalysisTask(CmdLineTask):
             fitLineUpper = [2.0, -1.31]
             fitLineLower = [0.61, -1.78]
             # TODO: The return needs to change
-            poly = yield from colorColorPolyFitPlot(plotInfoDict, nameStr,
-                                                    self.log, catColors("HSC-G", "HSC-R", mags, good),
-                                                    catColors("HSC-R", "HSC-I", mags, good),
+            poly = yield from colorColorPolyFitPlot(plotInfoDict, nameStr, self.log,
+                                                    catColors(colStrList[0], colStrList[1], mags, good),
+                                                    catColors(colStrList[1], colStrList[2], mags, good),
                                                     "g - r  [{0:s}]".format(fluxColStr),
                                                     "r - i  [{0:s}]".format(fluxColStr), self.fluxFilter,
                                                     xRange=xRange, yRange=yRange, order=3,
@@ -1414,20 +1700,22 @@ class ColorAnalysisTask(CmdLineTask):
             if fluxColumn != "base_PsfFlux_instFlux":
                 self.log.info("nameStr: noFit ({1:s}) = {0:s}".format(nameStr, fluxColumn))
                 yield from colorColorPlot(plotInfoDict, nameStr,
-                                          self.log, catColors("HSC-G", "HSC-R", mags, decentStars),
-                                          catColors("HSC-R", "HSC-I", mags, decentStars),
-                                          catColors("HSC-G", "HSC-R", mags, decentGalaxies),
-                                          catColors("HSC-R", "HSC-I", mags, decentGalaxies),
+                                          self.log, catColors(colStrList[0], colStrList[1], mags,
+                                                              decentStars),
+                                          catColors(colStrList[1], colStrList[2], mags, decentStars),
+                                          catColors(colStrList[0], colStrList[1], mags, decentGalaxies),
+                                          catColors(colStrList[1], colStrList[2], mags, decentGalaxies),
                                           decentStarsMag, decentGalaxiesMag,
                                           "g - r  [{0:s}]".format(fluxColStr),
                                           "r - i  [{0:s}]".format(fluxColStr), self.fluxFilter, fluxColStr,
                                           xRange=(xRange[0], xRange[1] + 0.6), yRange=yRange,
                                           **colorColorKwargs)
                 yield from colorColor4MagPlots(plotInfoDict, nameStr,
-                                               self.log, catColors("HSC-G", "HSC-R", mags, decentStars),
-                                               catColors("HSC-R", "HSC-I", mags, decentStars),
-                                               catColors("HSC-G", "HSC-R", mags, decentGalaxies),
-                                               catColors("HSC-R", "HSC-I", mags, decentGalaxies),
+                                               self.log, catColors(colStrList[0], colStrList[1], mags,
+                                                                   decentStars),
+                                               catColors(colStrList[1], colStrList[2], mags, decentStars),
+                                               catColors(colStrList[0], colStrList[1], mags, decentGalaxies),
+                                               catColors(colStrList[1], colStrList[2], mags, decentGalaxies),
                                                decentStarsMag, decentGalaxiesMag,
                                                "g - r  [{0:s}]".format(fluxColStr),
                                                "r - i  [{0:s}]".format(fluxColStr), self.fluxFilter,
@@ -1449,7 +1737,8 @@ class ColorAnalysisTask(CmdLineTask):
                                               self.log, stdevEnforcer, forcedStr=forcedStr, zpLabel=geLabel,
                                               uberCalLabel=uberCalLabel)
 
-        if filters.issuperset(set(("HSC-R", "HSC-I", "HSC-Z"))):
+        # riz
+        if filters.issuperset(set((colStrList[1], colStrList[2], colStrList[3]))):
             # Do a linear fit to regions defined in Ivezic transforms
             transformPerp = self.config.transforms["yPerp"]
             transformPara = self.config.transforms["yPara"]
@@ -1463,8 +1752,8 @@ class ColorAnalysisTask(CmdLineTask):
             nameStr = filtersStr + fluxColStr + "-yFit"
             self.log.info("nameStr = {:s}".format(nameStr))
             yield from colorColorPolyFitPlot(plotInfoDict, nameStr,
-                                             self.log, catColors("HSC-R", "HSC-I", mags, good),
-                                             catColors("HSC-I", "HSC-Z", mags, good),
+                                             self.log, catColors(colStrList[1], colStrList[2], mags, good),
+                                             catColors(colStrList[2], colStrList[3], mags, good),
                                              "r - i  [{0:s}]".format(fluxColStr),
                                              "i - z  [{0:s}]".format(fluxColStr), self.fluxFilter,
                                              transformPerp=transformPerp, transformPara=transformPara,
@@ -1477,9 +1766,9 @@ class ColorAnalysisTask(CmdLineTask):
             fitLineLower = [0.11, -2.07]
             self.log.info("nameStr = {:s}".format(nameStr))
             # TODO: also change this
-            poly = yield from colorColorPolyFitPlot(plotInfoDict, nameStr,
-                                                    self.log, catColors("HSC-R", "HSC-I", mags, good),
-                                                    catColors("HSC-I", "HSC-Z", mags, good),
+            poly = yield from colorColorPolyFitPlot(plotInfoDict, nameStr, self.log,
+                                                    catColors(colStrList[1], colStrList[2], mags, good),
+                                                    catColors(colStrList[2], colStrList[3], mags, good),
                                                     "r - i  [{0:s}]".format(fluxColStr),
                                                     "i - z  [{0:s}]".format(fluxColStr), self.fluxFilter,
                                                     xRange=xRange, yRange=yRange, order=2,
@@ -1490,21 +1779,21 @@ class ColorAnalysisTask(CmdLineTask):
             # pruning, and no fit.
             if fluxColumn != "base_PsfFlux_instFlux":
                 self.log.info("nameStr: noFit ({1:s}) = {0:s}".format(nameStr, fluxColumn))
-                yield from colorColorPlot(plotInfoDict, nameStr,
-                                          self.log, catColors("HSC-R", "HSC-I", mags, decentStars),
-                                          catColors("HSC-I", "HSC-Z", mags, decentStars),
-                                          catColors("HSC-R", "HSC-I", mags, decentGalaxies),
-                                          catColors("HSC-I", "HSC-Z", mags, decentGalaxies),
+                yield from colorColorPlot(plotInfoDict, nameStr, self.log,
+                                          catColors(colStrList[1], colStrList[2], mags, decentStars),
+                                          catColors(colStrList[2], colStrList[3], mags, decentStars),
+                                          catColors(colStrList[1], colStrList[2], mags, decentGalaxies),
+                                          catColors(colStrList[2], colStrList[3], mags, decentGalaxies),
                                           decentStarsMag, decentGalaxiesMag,
                                           "r - i  [{0:s}]".format(fluxColStr),
                                           "i - z  [{0:s}]".format(fluxColStr), self.fluxFilter, fluxColStr,
                                           xRange=xRange, yRange=(yRange[0], yRange[1] + 0.2),
                                           **colorColorKwargs)
-                yield from colorColor4MagPlots(plotInfoDict, nameStr,
-                                               self.log, catColors("HSC-R", "HSC-I", mags, decentStars),
-                                               catColors("HSC-I", "HSC-Z", mags, decentStars),
-                                               catColors("HSC-R", "HSC-I", mags, decentGalaxies),
-                                               catColors("HSC-I", "HSC-Z", mags, decentGalaxies),
+                yield from colorColor4MagPlots(plotInfoDict, nameStr, self.log,
+                                               catColors(colStrList[1], colStrList[2], mags, decentStars),
+                                               catColors(colStrList[2], colStrList[3], mags, decentStars),
+                                               catColors(colStrList[1], colStrList[2], mags, decentGalaxies),
+                                               catColors(colStrList[2], colStrList[3], mags, decentGalaxies),
                                                decentStarsMag, decentGalaxiesMag,
                                                "r - i  [{0:s}]".format(fluxColStr),
                                                "i - z  [{0:s}]".format(fluxColStr), self.fluxFilter,
@@ -1524,7 +1813,7 @@ class ColorAnalysisTask(CmdLineTask):
                                               shortName, plotInfoDict, byFilterAreaDict[self.fluxFilter],
                                               self.log, stdevEnforcer, forcedStr=forcedStr, zpLabel=geLabel,
                                               uberCalLabel=uberCalLabel)
-        if filters.issuperset(set(("HSC-I", "HSC-Z", "HSC-Y"))):
+        if filters.issuperset(set((colStrList[2], colStrList[3], colStrList[4]))):
             filtersStr = "izy"
             nameStr = filtersStr + fluxColStr
             self.log.info("nameStr = {:s}".format(nameStr))
@@ -1534,9 +1823,9 @@ class ColorAnalysisTask(CmdLineTask):
                       self.config.plotRanges[filtersStr + "X1"])
             yRange = (self.config.plotRanges[filtersStr + "Y0"],
                       self.config.plotRanges[filtersStr + "Y1"])
-            poly = yield from colorColorPolyFitPlot(plotInfoDict, nameStr,
-                                                    self.log, catColors("HSC-I", "HSC-Z", mags, good),
-                                                    catColors("HSC-Z", "HSC-Y", mags, good),
+            poly = yield from colorColorPolyFitPlot(plotInfoDict, nameStr, self.log,
+                                                    catColors(colStrList[2], colStrList[3], mags, good),
+                                                    catColors(colStrList[3], colStrList[4], mags, good),
                                                     "i - z  [{0:s}]".format(fluxColStr),
                                                     "z - y  [{0:s}]".format(fluxColStr), self.fluxFilter,
                                                     xRange=xRange, yRange=yRange, order=2,
@@ -1548,20 +1837,20 @@ class ColorAnalysisTask(CmdLineTask):
             if fluxColumn != "base_PsfFlux_instFlux":
                 self.log.info("nameStr: noFit ({1:s}) = {0:s}".format(nameStr, fluxColumn))
                 yield from colorColorPlot(plotInfoDict, nameStr, self.log,
-                                          catColors("HSC-I", "HSC-Z", mags, decentStars),
-                                          catColors("HSC-Z", "HSC-Y", mags, decentStars),
-                                          catColors("HSC-I", "HSC-Z", mags, decentGalaxies),
-                                          catColors("HSC-Z", "HSC-Y", mags, decentGalaxies),
+                                          catColors(colStrList[2], colStrList[3], mags, decentStars),
+                                          catColors(colStrList[3], colStrList[4], mags, decentStars),
+                                          catColors(colStrList[2], colStrList[3], mags, decentGalaxies),
+                                          catColors(colStrList[3], colStrList[4], mags, decentGalaxies),
                                           decentStarsMag, decentGalaxiesMag,
                                           "i - z  [{0:s}]".format(fluxColStr),
                                           "z - y  [{0:s}]".format(fluxColStr), self.fluxFilter, fluxColStr,
                                           xRange=xRange, yRange=(yRange[0], yRange[1] + 0.2),
                                           **colorColorKwargs)
-                yield from colorColor4MagPlots(plotInfoDict, nameStr,
-                                               self.log, catColors("HSC-I", "HSC-Z", mags, decentStars),
-                                               catColors("HSC-Z", "HSC-Y", mags, decentStars),
-                                               catColors("HSC-I", "HSC-Z", mags, decentGalaxies),
-                                               catColors("HSC-Z", "HSC-Y", mags, decentGalaxies),
+                yield from colorColor4MagPlots(plotInfoDict, nameStr, self.log,
+                                               catColors(colStrList[2], colStrList[3], mags, decentStars),
+                                               catColors(colStrList[3], colStrList[4], mags, decentStars),
+                                               catColors(colStrList[2], colStrList[3], mags, decentGalaxies),
+                                               catColors(colStrList[3], colStrList[4], mags, decentGalaxies),
                                                decentStarsMag, decentGalaxiesMag,
                                                "i - z  [{0:s}]".format(fluxColStr),
                                                "z - y  [{0:s}]".format(fluxColStr), self.fluxFilter,
@@ -1582,7 +1871,7 @@ class ColorAnalysisTask(CmdLineTask):
                                               self.log, stdevEnforcer, forcedStr=forcedStr, zpLabel=geLabel,
                                               uberCalLabel=uberCalLabel)
 
-        if filters.issuperset(set(("HSC-Z", "NB0921", "HSC-Y"))):
+        if filters.issuperset(set((colStrList[3], colStrList[5], colStrList[4]))):
             filtersStr = "z9y"
             xRange = (self.config.plotRanges[filtersStr + "X0"],
                       self.config.plotRanges[filtersStr + "X1"])
@@ -1593,8 +1882,8 @@ class ColorAnalysisTask(CmdLineTask):
             fitLineUpper = [0.65, -3.5]
             fitLineLower = [-0.01, -0.96]
             poly = yield from colorColorPolyFitPlot(plotInfoDict, nameStr, self.log,
-                                                    catColors("HSC-Z", "NB0921", mags, good),
-                                                    catColors("NB0921", "HSC-Y", mags, good),
+                                                    catColors(colStrList[3], colStrList[5], mags, good),
+                                                    catColors(colStrList[5], colStrList[4], mags, good),
                                                     "z-n921  [{0:s}]".format(fluxColStr),
                                                     "n921-y  [{0:s}]".format(fluxColStr), self.fluxFilter,
                                                     xRange=xRange, yRange=yRange,
@@ -1605,11 +1894,11 @@ class ColorAnalysisTask(CmdLineTask):
             # pruning, and no fit.
             if fluxColumn != "base_PsfFlux_instFlux":
                 self.log.info("nameStr: noFit ({1:s}) = {0:s}".format(nameStr, fluxColumn))
-                yield from colorColorPlot(plotInfoDict, nameStr,
-                                          self.log, catColors("HSC-Z", "NB0921", mags, decentStars),
-                                          catColors("NB0921", "HSC-Y", mags, decentStars),
-                                          catColors("HSC-Z", "NB0921", mags, decentGalaxies),
-                                          catColors("NB0921", "HSC-Y", mags, decentGalaxies),
+                yield from colorColorPlot(plotInfoDict, nameStr, self.log,
+                                          catColors(colStrList[3], colStrList[5], mags, decentStars),
+                                          catColors(colStrList[5], colStrList[4], mags, decentStars),
+                                          catColors(colStrList[3], colStrList[5], mags, decentGalaxies),
+                                          catColors(colStrList[5], colStrList[4], mags, decentGalaxies),
                                           decentStarsMag, decentGalaxiesMag,
                                           "z-n921  [{0:s}]".format(fluxColStr),
                                           "n921-y  [{0:s}]".format(fluxColStr), self.fluxFilter, fluxColStr,
@@ -1617,11 +1906,11 @@ class ColorAnalysisTask(CmdLineTask):
                                           magThreshold=prettyBrightThreshold,
                                           geLabel=geLabel, unitScale=self.unitScale,
                                           uberCalLabel=uberCalLabel)
-                yield from colorColor4MagPlots(plotInfoDict, nameStr,
-                                               self.log, catColors("HSC-Z", "NB0921", mags, decentStars),
-                                               catColors("NB0921", "HSC-Y", mags, decentStars),
-                                               catColors("HSC-Z", "NB0921", mags, decentGalaxies),
-                                               catColors("NB0921", "HSC-Y", mags, decentGalaxies),
+                yield from colorColor4MagPlots(plotInfoDict, nameStr, self.log,
+                                               catColors(colStrList[3], colStrList[5], mags, decentStars),
+                                               catColors(colStrList[5], colStrList[4], mags, decentStars),
+                                               catColors(colStrList[3], colStrList[5], mags, decentGalaxies),
+                                               catColors(colStrList[5], colStrList[4], mags, decentGalaxies),
                                                decentStarsMag, decentGalaxiesMag,
                                                "z-n921  [{0:s}]".format(fluxColStr),
                                                "n921-y  [{0:s}]".format(fluxColStr), self.fluxFilter,
@@ -1750,6 +2039,11 @@ def colorColorPolyFitPlot(plotInfoDict, description, log, xx, yy, xLabel, yLabel
                 "Not enough good data points ({0:d}) for polynomial fit of order {1:d}".format(nKeep, order))
 
         poly = np.polyfit(xx[keep], yy[keep], order)
+
+    nKeep = np.sum(keep)
+    if nKeep < order:
+        raise RuntimeError("Not enough good data points ({0:d}) for polynomial fit of order {1:d}".
+                           format(nKeep, order))
 
     # Calculate the point density
     xyKeep = np.vstack([xx[keep], yy[keep]])

@@ -933,12 +933,12 @@ def checkPatchOverlap(patchList, tractInfo):
     """
     for i, patch0 in enumerate(patchList):
         overlappingPatches = False
-        patchIndex = [int(val) for val in patch0.split(",")]
+        patchIndex = [int(val) for val in patch0.split(",")] if isinstance(patch0, str) else patch0
         patchInfo = tractInfo.getPatchInfo(patchIndex)
         patchBBox0 = patchInfo.getOuterBBox()
         for j, patch1 in enumerate(patchList):
             if patch1 != patch0 and j > i:
-                patchIndex = [int(val) for val in patch1.split(",")]
+                patchIndex = [int(val) for val in patch1.split(",")] if isinstance(patch1, str) else patch1
                 patchInfo = tractInfo.getPatchInfo(patchIndex)
                 patchBBox1 = patchInfo.getOuterBBox()
                 xCen0, xCen1 = patchBBox0.getCenterX(), patchBBox1.getCenterX()
@@ -1521,7 +1521,7 @@ def calibrateSourceCatalogMosaic(dataRef, catalog, fluxKeys=None, errKeys=None, 
     return catalog
 
 
-def calibrateSourceCatalogPhotoCalib(dataRef, catalog, photoCalibDataset, fluxKeys=None, zp=27.0):
+def calibrateSourceCatalogPhotoCalib(dataRef, catalog, photoCalibDataset, isGen3, fluxKeys=None, zp=27.0):
     """Calibrate catalog with PhotoCalib results.
 
     The suite of external photometric calibrations in existence include:
@@ -1557,7 +1557,13 @@ def calibrateSourceCatalogPhotoCalib(dataRef, catalog, photoCalibDataset, fluxKe
     These columns are named <flux column>_mag and <flux column>_magErr,
     respectively.
     """
-    photoCalib = dataRef.get(photoCalibDataset)
+    if not isGen3:
+        photoCalib = dataRef.get(photoCalibDataset)
+    else:
+        dataId = dataRef["dataId"]
+        externalPhotoCalibCatalog = dataRef["butler"].get(photoCalibDataset, dataId=dataId)
+        row = externalPhotoCalibCatalog.find(dataId["detector"])
+        photoCalib = row.getPhotoCalib()
     schema = getSchema(catalog)
     # Scale to AB and convert to constant zero point, as for the coadds
     factor = NANOJANSKYS_PER_AB_FLUX/10.0**(0.4*zp)
@@ -1879,12 +1885,33 @@ def getRepoInfo(dataRef, coaddName=None, coaddDataset=None, catDataset="src", do
     if coaddName and not coaddDataset or not coaddName and coaddDataset:
         raise RuntimeError("If one of coaddName or coaddDataset is specified, the other must be as well.")
 
-    butler = dataRef.getButler()
-    camera = butler.get("camera")
-    dataId = dataRef.dataId.copy()
+    if hasattr(dataRef, "getButler"):
+        butler = dataRef.getButler()
+        camera = butler.get("camera")
+        dataId = dataRef.dataId.copy()
+        delimiterStr = "_"
+        isGen3 = False
+    else:
+        butler = dataRef["butler"]
+        cameraName = dataRef["camera"]
+        if cameraName == "HSC":
+            from lsst.obs.subaru import HyperSuprimeCam
+            instrument = HyperSuprimeCam()
+        elif cameraName == "LSSTCam-imSim":
+            from lsst.obs.lsst.imsim import LsstCamImSim
+            instrument = LsstCamImSim()
+        else:
+            raise RuntimeError("Unknown camera {}".format(cameraName))
+        camera = instrument.getCamera()
+        dataId = dataRef["dataId"].copy()
+        delimiterStr = "."
+        isGen3 = True
     isCoadd = True if "patch" in dataId else False
     try:
-        filterName = dataId["filter"]
+        if isGen3 and isCoadd:
+            filterName = dataId["band"]
+        else:
+            filterName = dataId["filter"]
     except KeyError:
         if isCoadd:
             filterName = butler.get(coaddName + "Coadd_calexp_filter", dataId)
@@ -1892,40 +1919,63 @@ def getRepoInfo(dataRef, coaddName=None, coaddDataset=None, catDataset="src", do
             filterName = butler.get("calexp_filter", dataId)
         dataId["filter"] = filterName
     if isCoadd:
-        bbox = butler.get(coaddName + "Coadd_bbox", dataId)
-        subBbox = geom.BoxI(geom.PointI(bbox.beginX, bbox.beginY), geom.ExtentI(1, 1))
-        expInfo = butler.get(coaddName + "Coadd_calexp_sub", dataId=dataId, bbox=subBbox).getInfo()
+        if not isGen3:
+            bbox = butler.get(coaddName + "Coadd_bbox", dataId)
+            subBbox = geom.BoxI(geom.PointI(bbox.beginX, bbox.beginY), geom.ExtentI(1, 1))
+            expInfo = butler.get(coaddName + "Coadd_calexp_sub", dataId=dataId, bbox=subBbox).getInfo()
     else:
-        bbox = butler.get("calexp_bbox", dataId)
+        bbox = butler.get("calexp" + delimiterStr + "bbox", dataId)
         subBbox = geom.BoxI(geom.PointI(bbox.beginX, bbox.beginY), geom.ExtentI(1, 1))
-        expInfo = butler.get("calexp_sub", dataId=dataId, bbox=subBbox).getInfo()
-    genericBandName = expInfo.getFilterLabel().bandLabel
-    ccdKey = None if isCoadd else findCcdKey(dataId)
+        if isGen3:
+            expInfo = butler.get("calexp", dataId=dataId, parameters={'bbox': subBbox}).getInfo()
+        else:
+            expInfo = butler.get("calexp" + delimiterStr + "sub", dataId=dataId, bbox=subBbox).getInfo()
+    if isGen3:
+        ccdKey = "detector"
+        genericBandName = filterName
+    else:
+        ccdKey = None if isCoadd else findCcdKey(dataId)
+        genericBandName = expInfo.getFilterLabel().bandLabel
+
     try:  # Check metadata to see if stack used was HSC
         metaStr = coaddName + coaddDataset + "_md" if coaddName else "calexp_md"
         metadata = butler.get(metaStr, dataId)
-    except AttributeError:
+        hscRun = checkHscStack(metadata)
+    except (AttributeError, KeyError):
         metadata = None
-    hscRun = checkHscStack(metadata)
-    skymap = butler.get(coaddName + "Coadd_skyMap") if coaddName else None
+        hscRun = None
+
+    if isGen3:
+        skymap = butler.get("skyMap") if coaddName else None
+    else:
+        skymap = butler.get(coaddName + "Coadd_skyMap") if coaddName else None
     wcs = None
     tractInfo = None
     if isCoadd:
-        coaddImageName = "Coadd_calexp_hsc" if hscRun else "Coadd_calexp"  # To get the coadd's WCS
-        wcs = butler.get(coaddName + coaddImageName + "_wcs", dataId)
+        # To get the coadd's WCS
+        coaddImageName = "Coadd_calexp_hsc" if hscRun else "Coadd_calexp"
+        wcs = butler.get(coaddName + coaddImageName + delimiterStr + "wcs", dataId)
         catDataset = coaddName + coaddDataset
         tractInfo = skymap[dataId["tract"]]
     photoCalibDataset = None
     if doApplyExternalPhotoCalib:
-        photoCalibDataset = "fcr_hsc" if hscRun else externalPhotoCalibName + "_photoCalib"
+        if isGen3:
+            photoCalibDataset = externalPhotoCalibName + "PhotoCalibCatalog"
+        else:
+            photoCalibDataset = "fcr_hsc" if hscRun else externalPhotoCalibName + "_photoCalib"
     skyWcsDataset = None
     if doApplyExternalSkyWcs:
-        skyWcsDataset = "wcs_hsc" if hscRun else externalSkyWcsName + "_wcs"
-        skymap = skymap if skymap else butler.get("deepCoadd_skyMap")
+        if isGen3:
+            skyWcsDataset = externalSkyWcsName + "SkyWcsCatalog"
+            skymap = skymap if skymap else butler.get("skyMap")
+        else:
+            skyWcsDataset = "wcs_hsc" if hscRun else externalSkyWcsName + "_wcs"
+            skymap = skymap if skymap else butler.get("deepCoadd_skyMap")
         try:
             tractInfo = skymap[dataId["tract"]]
         except KeyError:
             tractInfo = None
+
     return Struct(
         butler=butler,
         camera=camera,
@@ -1941,6 +1991,8 @@ def getRepoInfo(dataRef, coaddName=None, coaddDataset=None, catDataset="src", do
         skymap=skymap,
         wcs=wcs,
         tractInfo=tractInfo,
+        delimiterStr=delimiterStr,
+        isGen3=isGen3
     )
 
 
@@ -1990,20 +2042,40 @@ def getCcdNameRefList(dataRefList):
 
 
 def getDataExistsRefList(dataRefList, dataset):
-    dataExistsRefList = None
-    ccdKey = findCcdKey(dataRefList[0].dataId)
-    if "raft" in dataRefList[0].dataId:
-        dataExistsRefList = [re.sub("[,]", "", str(dataRef.dataId["raft"]) + str(dataRef.dataId[ccdKey])) for
-                             dataRef in dataRefList if dataRef.datasetExists(dataset)]
+    dataExistsRefList = []
+    dataExistsCcdList = []
+    dataRefTemp = dataRefList[0]
+    isGen3 = not hasattr(dataRefTemp, "datasetExists")
+    dataIdTemp = dataRefTemp["dataId"] if isGen3 else dataRefTemp.dataId
+    ccdKey = findCcdKey(dataIdTemp)
+    if not isGen3:
+        dataExistsRefList = [dataRef for dataRef in dataRefList if dataRef.datasetExists(dataset)]
+        for dataRef in dataRefList:
+            if "raft" in dataRef.dataId:
+                dataExistsCcdList = [
+                    re.sub("[,]", "", str(dataRef.dataId["raft"]) + str(dataRef.dataId[ccdKey])) for
+                    dataRef in dataRefList if dataRef.datasetExists(dataset)]
+            else:
+                dataExistsCcdList = [
+                    dataRef.dataId[ccdKey] for dataRef in dataRefList if dataRef.datasetExists(dataset)]
+        # cull multiple entries
+        dataExistsRefList = list(set(dataExistsRefList))
+        dataExistsCcdList = list(set(dataExistsCcdList))
     else:
-        dataExistsRefList = [dataRef.dataId[ccdKey] for dataRef in dataRefList if
-                             dataRef.datasetExists(dataset)]
-    # cull multiple entries
-    dataExistsRefList = list(set(dataExistsRefList))
+        for dataRef in dataRefList:
+            dataId = dataRef["dataId"]
+            try:
+                dataRef["butler"].getURI(dataset, dataId=dataId)
+                dataExistsRefList.append(dataRef)
+                dataExistsCcdList.append(dataRef["dataId"]["detector"])
+            except LookupError:
+                if dataId["detector"] != 999:
+                    print("Could not find {} dataset for dataId {}".format(dataset, dataId))
+                continue
 
-    if dataExistsRefList is None:
+    if len(dataExistsRefList) == 0:
         raise RuntimeError("dataExistsRef list is empty")
-    return dataExistsRefList
+    return dataExistsRefList, dataExistsCcdList
 
 
 def fLinear(p, x):
@@ -3169,10 +3241,23 @@ def computeAreaDict(repoInfo, dataRefList, dataset="", fakeCat=None, raFakesCol=
     for dataRef in dataRefList:
         # getUri is less safe but enables us to use an efficient
         # ExposureFitsReader.
-        fname = repoInfo.butler.getUri(dataset + "calexp", dataRef.dataId)
+        if repoInfo.isGen3:
+            dataId = dataRef["dataId"].copy()
+            uri = repoInfo.butler.getURI(dataset + "calexp", dataId)
+            fname = uri.path
+            fname = fname.replace("%2C", ",")  # hack for gen2-gen3 converted repos
+            ccdId = dataId[elementKey]
+        else:
+            fname = repoInfo.butler.getUri(dataset + "calexp", dataRef.dataId)
+            ccdId = dataRef.dataId[elementKey]
         reader = afwImage.ExposureFitsReader(fname)
-        if repoInfo.skyWcsDataset is not None:
-            wcs = dataRef.get(repoInfo.skyWcsDataset)
+        if repoInfo.skyWcsDataset is not None and isCcd:
+            if not repoInfo.isGen3:
+                wcs = dataRef.get(repoInfo.skyWcsDataset)
+            else:
+                externalSkyWcsCatalog = dataRef["butler"].get(repoInfo.skyWcsDataset, dataId=dataId)
+                row = externalSkyWcsCatalog.find(dataId["detector"])
+                wcs = row.getWcs()
         else:
             wcs = reader.readWcs()
         mask = reader.readMask()
@@ -3188,9 +3273,9 @@ def computeAreaDict(repoInfo, dataRefList, dataset="", fakeCat=None, raFakesCol=
         else:
             pixScale = wcs.getPixelScale(reader.readBBox().getCenter()).asArcseconds()
             corners = wcs.pixelToSky(geom.Box2D(reader.readBBox()).getCorners())
-        areaDict["corners_" + str(dataRef.dataId[elementKey])] = corners
+        areaDict["corners_" + str(ccdId)] = corners
         area = numGoodPix*pixScale**2
-        areaDict[dataRef.dataId[elementKey]] = area
+        areaDict[ccdId] = area
 
         if fakeCat is not None:
             fakeCat = determineIfSrcOnElement(fakeCat, dataRef, corners, wcs, elementKey, mask=mask,
@@ -3315,8 +3400,8 @@ def getParquetColumnsList(pqTable, dfDataset=None, filterName=None):
         parquet tables, the columns list will be associated with the level
         specified by ``dfDataset`` and ``filterName``.
     """
+    nLevels = 3
     if isinstance(pqTable, MultilevelParquetTable):
-        nLevels = 3
         if len(pqTable.columnLevels) != nLevels:
             raise RuntimeError("Unknown multilevel parquet table: expect {:} levels but got {:}".
                                format(nLevels, len(pqTable.columnLevels)))
@@ -3327,6 +3412,14 @@ def getParquetColumnsList(pqTable, dfDataset=None, filterName=None):
         catColumnsList = [pqColumnNames[icx] for idx, ifx, icx in zip(*pqTable.columnIndex.codes)
                           if idx == list(pqDatasetNames).index(dfDataset)
                           and ifx == list(pqFilterNames).index(filterName)]
+    elif isinstance(pqTable.columns, pd.MultiIndex):
+        if len(pqTable.columns.levels) != nLevels:
+            raise RuntimeError("Unknown multiIndex dataFrame: expect {:} levels but got {:}".
+                               format(nLevels, len(pqTable.columns.levels)))
+        if dfDataset is None or filterName is None:
+            raise RuntimeError("Both dfDataset and filterName must be set for multiIndex dataFrames: "
+                               "but got {:} and {:}, respectively".format(dfDataset, filterName))
+        catColumnsList = [tup[2] for tup in pqTable.columns if tup[0] == dfDataset and tup[1] == filterName]
     else:
         catColumnsList = pqTable.columns
     return catColumnsList
