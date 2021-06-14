@@ -1238,10 +1238,10 @@ class Analysis(object):
 
             description = description.replace("Rho", "hsmRho")
             compareCol = "ext_shapeHSM_HsmSourceMoments"
-            psfCompareCol = "ext_shapeHSM_HsmPsfMoments"
+            psfCompareCol = "ext_shapeHSM_HsmPsfMomentsDebiased"
             shapeAlgorithm = "HSM"
             flags = list(self.config.flags) + ["ext_shapeHSM_HsmSourceMoments_flag",
-                                               "ext_shapeHSM_HsmPsfMoments_flag"]
+                                               "ext_shapeHSM_HsmPsfMomentsDebiased_flag"]
 
             # Cull the catalog of flagged sources
             bad = np.zeros(len(self.catalog), dtype=bool)
@@ -1255,7 +1255,7 @@ class Analysis(object):
             plotRhoStats(axes, rhoStats)
 
             if verifyJob is not None:
-                metaDict = {"shapeAlgorithm": "HSM"}
+                metaDict = {"shapeAlgorithm": "HSM (debiased)"}
                 verifyJob = updateVerifyJob(verifyJob, metaDict=metaDict)
                 measExtrasDictList = [{"name": kk, "value": vv, "label": None,
                                        "description": "keyword arguments relevant to treecorr"}
@@ -1282,6 +1282,7 @@ class Analysis(object):
                                                      measureRhoMetrics(rhoStats[rhoId], 1, ">"),
                                                      measExtrasDictList=measExtrasDictList)
 
+            shapeAlgorithm = "HSM (Debiased)"
             for figId, figax in enumerate(figAxes):
                 fig, ax = figax
                 figDescription = description + str(figId + 1)
