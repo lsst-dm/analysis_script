@@ -1946,9 +1946,16 @@ def getRepoInfo(dataRef, coaddName=None, coaddDataset=None, catDataset="src", do
         hscRun = None
 
     if isGen3:
-        skymap = butler.get("skyMap") if coaddName else None
+        try:
+            skymap = butler.get("skyMap")
+        except Exception:
+            skymap = None
     else:
-        skymap = butler.get(coaddName + "Coadd_skyMap") if coaddName else None
+        tempCoaddName = "deep" if coaddName is None else coaddName
+        try:
+            skymap = butler.get(tempCoaddName + "Coadd_skyMap")
+        except Exception:
+            skymap = None
     wcs = None
     tractInfo = None
     if isCoadd:
@@ -1971,10 +1978,10 @@ def getRepoInfo(dataRef, coaddName=None, coaddDataset=None, catDataset="src", do
         else:
             skyWcsDataset = "wcs_hsc" if hscRun else externalSkyWcsName + "_wcs"
             skymap = skymap if skymap else butler.get("deepCoadd_skyMap")
-        try:
-            tractInfo = skymap[dataId["tract"]]
-        except KeyError:
-            tractInfo = None
+    try:
+        tractInfo = skymap[dataId["tract"]]
+    except KeyError:
+        tractInfo = None
 
     return Struct(
         butler=butler,

@@ -848,13 +848,15 @@ class Analysis(object):
                 plotCcdOutline(axes, areaDict, ccdList,
                                raMin=raMin, raMax=raMax, decMin=decMin, decMax=decMax)
             else:
-                plotCcdOutline(axes, areaDict, ccdList, tractInfo=plotInfoDict["tractInfo"],
+                plotCcdOutline(axes, areaDict, ccdList, tractInfo=None,
                                raMin=raMin, raMax=raMax, decMin=decMin, decMax=decMax)
             if plotInfoDict["tractInfo"] is not None:
                 tractBBox = plotInfoDict["tractInfo"].getBBox()
                 tractWcs = plotInfoDict["tractInfo"].getWcs()
                 tractRa, tractDec = bboxToXyCoordLists(tractBBox, wcs=tractWcs)
-                axes.plot(tractRa, tractDec, "w--", linewidth=1, alpha=0.7, label=plotInfoDict["tract"])
+                tractRas = tractRa + (tractRa[0], )
+                tractDecs = tractDec + (tractDec[0], )
+                axes.plot(tractRas, tractDecs, "w--", linewidth=1, alpha=0.7, label=plotInfoDict["tract"])
 
         tractLevelPlot = "Coadd" in plotInfoDict["plotType"] or "Color" in plotInfoDict["plotType"]
         if plotInfoDict["tractInfo"] is not None and tractLevelPlot:

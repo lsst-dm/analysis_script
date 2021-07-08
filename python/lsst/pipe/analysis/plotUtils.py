@@ -712,8 +712,8 @@ def bboxToXyCoordLists(bbox, wcs=None, wcsUnits="deg"):
         else:
             coord = p
             corners.append([coord.getX(), coord.getY()])
-    xCoords, yCorrds = zip(*corners)
-    return xCoords, yCorrds
+    xCoords, yCoords = zip(*corners)
+    return xCoords, yCoords
 
 
 def getRaDecMinMaxPatchList(patchList, tractInfo, pad=0.0, nDecimals=4, raMin=360.0, raMax=0.0,
