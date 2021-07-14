@@ -587,7 +587,7 @@ def plotTractOutline(axes, tractInfo, patchList, fontSize=5, maxDegBeyondPatch=1
 
 
 def plotCcdOutline(axes, areaDict, ccdList, tractInfo=None, fontSize=8, lineStyle="-", color="k",
-                   labelStr=None, doPlotCcdId=True):
+                   labelStr=None, doPlotCcdId=True, raMin=-1e12, raMax=1e12, decMin=-1e12, decMax=1e12):
     """Plot the outlines of the ccds in ccdList on a given axis.
 
     Parameters
@@ -638,10 +638,11 @@ def plotCcdOutline(axes, areaDict, ccdList, tractInfo=None, fontSize=8, lineStyl
                     break
 
         if not tractInfo or inTract:
-            axes.plot(ras, decs, linestyle=lineStyle, color=color, linewidth=1, label=labelStr)
-            if doPlotCcdId:
-                axes.text(cenX, cenY, "{}".format(ccd), ha="center", va="center", fontsize=fontSize,
-                          color=color)
+            if cenX > raMin and cenX < raMax and cenY > decMin and cenY < decMax:
+                axes.plot(ras, decs, linestyle=lineStyle, color=color, linewidth=1, label=labelStr)
+                if doPlotCcdId:
+                    axes.text(cenX, cenY, "{}".format(ccd), ha="center", va="center", fontsize=fontSize,
+                              color=color)
 
 
 def plotPatchOutline(axes, tractInfo, patchList, plotUnits="deg", idFontSize=None):
@@ -650,7 +651,7 @@ def plotPatchOutline(axes, tractInfo, patchList, plotUnits="deg", idFontSize=Non
     validWcsUnits = ["deg", "rad"]
     idFontSize = max(5, 9 - int(0.4*len(patchList))) if not idFontSize else idFontSize
     for ip, patch in enumerate(tractInfo):
-        if str(patch.getIndex()[0])+","+str(patch.getIndex()[1]) in patchList:
+        if str(patch.getIndex()[0]) + "," + str(patch.getIndex()[1]) in patchList:
             if len(patchList) < 9:
                 if plotUnits in validWcsUnits:
                     xCoord, yCoord = bboxToXyCoordLists(patch.getOuterBBox(), wcs=tractInfo.getWcs(),
@@ -711,8 +712,8 @@ def bboxToXyCoordLists(bbox, wcs=None, wcsUnits="deg"):
         else:
             coord = p
             corners.append([coord.getX(), coord.getY()])
-    xCoords, yCorrds = zip(*corners)
-    return xCoords, yCorrds
+    xCoords, yCoords = zip(*corners)
+    return xCoords, yCoords
 
 
 def getRaDecMinMaxPatchList(patchList, tractInfo, pad=0.0, nDecimals=4, raMin=360.0, raMax=0.0,
@@ -901,6 +902,9 @@ def determineExternalCalLabel(repoInfo, patch, coaddName="deep"):
     """
     # Find a visit/ccd input so that you can check for meas_mosaic input (i.e.
     # to set uberCalLabel).
+    if repoInfo.isGen3:
+        return "Unknown_Gen3"
+
     coaddDataId = {"tract": repoInfo.tractInfo.getId(), "patch": patch, "filter": repoInfo.filterName}
     fname = repoInfo.butler.getUri(coaddName + "Coadd_calexp", coaddDataId)
     coaddInputs = afwImage.ExposureFitsReader(fname).readExposureInfo().getCoaddInputs()
@@ -1049,7 +1053,10 @@ def getPlotInfo(repoInfo):
     camera = repoInfo.camera
     cameraName = camera.getName()
     dataId = repoInfo.dataId
-    filterName = dataId["filter"]
+    if repoInfo.isGen3 and "band" in dataId:
+        filterName = dataId["band"]
+    else:
+        filterName = dataId["filter"]
     ccdKey = repoInfo.ccdKey
     # Try to get the visit and patch id.  Set to None if not available.
     try:
@@ -1064,7 +1071,12 @@ def getPlotInfo(repoInfo):
     tract = str(dataId["tract"])
     photoCalibDataset = repoInfo.photoCalibDataset
     skyWcsDataset = repoInfo.skyWcsDataset
-    rerun = list(repoInfo.butler.storage.repositoryCfgs)[0]
+    try:
+        rerun = list(repoInfo.butler.storage.repositoryCfgs)[0]
+    except AttributeError:
+        rootDir = str(repoInfo.butler.datastore.root)
+        rootDir = rootDir.replace("file://", "")
+        rerun = rootDir + repoInfo.butler.collections[0]
 
     plotInfoDict = dict(camera=camera, cameraName=cameraName, filter=filterName, ccdKey=ccdKey, tract=tract,
                         visit=visit, patch=patch, photoCalibDataset=photoCalibDataset,

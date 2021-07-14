@@ -376,9 +376,7 @@ class Analysis(object):
 
         axScatter.tick_params(which="both", direction="in", labelsize=9)
 
-        if plotInfoDict["plotType"] == "plotCompareVisit":
-            ccdList = plotInfoDict["allCcdList"]
-        elif plotInfoDict["plotType"] == "plotVisit":
+        if "Visit" in plotInfoDict["plotType"]:
             ccdList = plotInfoDict["ccdList"]
         if ("Visit" in plotInfoDict["plotType"] and plotInfoDict["camera"] is not None
                 and ccdList is not None):
@@ -390,7 +388,7 @@ class Analysis(object):
         if self.config.doPlotTractOutline and tractLevelPlot:
             axTopRight = plt.axes(topRight)
             axTopRight.set_aspect("equal")
-            plotTractOutline(axTopRight, plotInfoDict["tractInfo"], plotInfoDict["patchList"])
+            plotTractOutline(axTopRight, plotInfoDict["tractInfo"], plotInfoDict["patchIdList"])
 
         dataType = "all" if "all" in self.data else "star"
         inLimits = self.data[dataType].quantity < self.qMax
@@ -762,14 +760,11 @@ class Analysis(object):
         if plotInfoDict["camera"] is not None and plotInfoDict["plotType"] == "plotVisit":
             axTopMiddle = plt.axes([0.42, 0.68, 0.2, 0.2])
             axTopMiddle.set_aspect("equal")
-            if plotInfoDict["plotType"] == "plotCompareVisit":
-                plotCameraOutline(axTopMiddle, plotInfoDict["camera"], plotInfoDict["allCcdList"])
-            else:
-                plotCameraOutline(axTopMiddle, plotInfoDict["camera"], plotInfoDict["ccdList"])
+            plotCameraOutline(axTopMiddle, plotInfoDict["camera"], plotInfoDict["ccdList"])
         if self.config.doPlotTractOutline and "Coadd" in plotInfoDict["plotType"]:
             axTopMiddle = plt.axes([0.42, 0.68, 0.2, 0.2])
             axTopMiddle.set_aspect("equal")
-            plotTractOutline(axTopMiddle, plotInfoDict["tractInfo"], plotInfoDict["patchList"])
+            plotTractOutline(axTopMiddle, plotInfoDict["tractInfo"], plotInfoDict["patchIdList"])
 
         yield Struct(fig=fig, description=description, stats=self.stats, statsHigh=self.statsHigh, dpi=120,
                      style="hist")
@@ -848,30 +843,31 @@ class Analysis(object):
         ptSize = None
 
         if "Visit" in plotInfoDict["plotType"]:
-            if plotInfoDict["plotType"] == "plotCompareVisit":
-                ccdList = plotInfoDict["allCcdList"]
-            else:
-                ccdList = plotInfoDict["ccdList"]
+            ccdList = plotInfoDict["ccdList"]
             if any(ss in description for ss in ["commonZp", "_raw"]):
-                plotCcdOutline(axes, areaDict, ccdList)
+                plotCcdOutline(axes, areaDict, ccdList,
+                               raMin=raMin, raMax=raMax, decMin=decMin, decMax=decMax)
             else:
-                plotCcdOutline(axes, areaDict, ccdList, tractInfo=plotInfoDict["tractInfo"])
+                plotCcdOutline(axes, areaDict, ccdList, tractInfo=None,
+                               raMin=raMin, raMax=raMax, decMin=decMin, decMax=decMax)
             if plotInfoDict["tractInfo"] is not None:
                 tractBBox = plotInfoDict["tractInfo"].getBBox()
                 tractWcs = plotInfoDict["tractInfo"].getWcs()
                 tractRa, tractDec = bboxToXyCoordLists(tractBBox, wcs=tractWcs)
-                axes.plot(tractRa, tractDec, "w--", linewidth=1, alpha=0.7, label=plotInfoDict["tract"])
+                tractRas = tractRa + (tractRa[0], )
+                tractDecs = tractDec + (tractDec[0], )
+                axes.plot(tractRas, tractDecs, "w--", linewidth=1, alpha=0.7, label=plotInfoDict["tract"])
 
         tractLevelPlot = "Coadd" in plotInfoDict["plotType"] or "Color" in plotInfoDict["plotType"]
         if plotInfoDict["tractInfo"] is not None and tractLevelPlot:
-            patchBoundary = getRaDecMinMaxPatchList(plotInfoDict["patchList"], plotInfoDict["tractInfo"],
+            patchBoundary = getRaDecMinMaxPatchList(plotInfoDict["patchIdList"], plotInfoDict["tractInfo"],
                                                     pad=pad, nDecimals=2, raMin=raMin, raMax=raMax,
                                                     decMin=decMin, decMax=decMax)
             raMin = patchBoundary.raMin
             raMax = patchBoundary.raMax
             decMin = patchBoundary.decMin
             decMax = patchBoundary.decMax
-            plotPatchOutline(axes, plotInfoDict["tractInfo"], plotInfoDict["patchList"])
+            plotPatchOutline(axes, plotInfoDict["tractInfo"], plotInfoDict["patchIdList"])
 
         stats0 = None
         lightShades = ["white", "lavenderblush", "floralwhite", "paleturquoise", ]
@@ -1102,18 +1098,19 @@ class Analysis(object):
         axes.tick_params(which="both", direction="in", top=True, right=True, labelsize=8)
 
         if plotInfoDict["plotType"] == "plotVisit":
-            plotCcdOutline(axes, areaDict, plotInfoDict["ccdList"], tractInfo=plotInfoDict["tractInfo"])
+            plotCcdOutline(axes, areaDict, plotInfoDict["ccdList"], tractInfo=plotInfoDict["tractInfo"],
+                           raMin=raMin, raMax=raMax, decMin=raMin, decMax=decMax)
 
         if plotInfoDict["tractInfo"] is not None and "Coadd" in plotInfoDict["plotType"]:
             for ip, patch in enumerate(plotInfoDict["tractInfo"]):
-                if str(patch.getIndex()[0])+","+str(patch.getIndex()[1]) in plotInfoDict["patchList"]:
+                if str(patch.getIndex()[0]) + "," + str(patch.getIndex()[1]) in plotInfoDict["patchIdList"]:
                     wcs = plotInfoDict["tractInfo"].getWcs()
                     raPatch, decPatch = bboxToXyCoordLists(patch.getOuterBBox(), wcs=wcs)
                     raMin = min(np.round(min(raPatch) - pad, 2), raMin)
                     raMax = max(np.round(max(raPatch) + pad, 2), raMax)
                     decMin = min(np.round(min(decPatch) - pad, 2), decMin)
                     decMax = max(np.round(max(decPatch) + pad, 2), decMax)
-            plotPatchOutline(axes, plotInfoDict["tractInfo"], plotInfoDict["patchList"])
+            plotPatchOutline(axes, plotInfoDict["tractInfo"], plotInfoDict["patchIdList"])
 
         e1 = E1Resids(compareCol, psfCompareCol)
         e1 = e1(catalog)
@@ -1466,7 +1463,7 @@ class Analysis(object):
         plt.text(-0.15, 0.5, "Dec (deg)", rotation=90, **textKwargs)
 
         if doPlotPatchOutline:
-            plotPatchOutline(axes, plotInfoDict["tractInfo"], plotInfoDict["patchList"], plotUnits="pixel",
+            plotPatchOutline(axes, plotInfoDict["tractInfo"], plotInfoDict["patchIdList"], plotUnits="pixel",
                              idFontSize=5)
         xOff = 0.0
         if plotInfoDict["cameraName"] is not None:
@@ -1673,10 +1670,14 @@ class Analysis(object):
 
         tractLevelPlot = "Coadd" in plotInfoDict["plotType"] or "Color" in plotInfoDict["plotType"]
         if self.config.doPlotTractOutline and tractLevelPlot:
-            if plotInfoDict["tractInfo"] is not None and len(plotInfoDict["patchList"]) > 0:
+            if "patchIdList" in plotInfoDict and plotInfoDict["patchIdList"] != plotInfoDict["patchList"]:
+                # Hack for gen3 patch ids
+                for patchId, patch in zip(plotInfoDict["patchIdList"], plotInfoDict["patchList"]):
+                    metricPerUnitDict[patchId] = metricPerUnitDict.pop(str(patch))
+            if plotInfoDict["tractInfo"] is not None and len(plotInfoDict["patchIdList"]) > 0:
                 axTopRight = plt.axes(topRight)
                 axTopRight.set_aspect("equal")
-                plotTractOutline(axTopRight, plotInfoDict["tractInfo"], plotInfoDict["patchList"],
+                plotTractOutline(axTopRight, plotInfoDict["tractInfo"], plotInfoDict["patchIdList"],
                                  metricPerPatchDict=metricPerUnitDict, metricStr=metricStr, fig=fig)
 
         yield Struct(fig=fig, description=description, stats=None, statsHigh=None, dpi=120, style="hist")

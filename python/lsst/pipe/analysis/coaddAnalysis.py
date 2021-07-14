@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import copy
 import os
 import astropy.units as u
 import numpy as np
@@ -56,6 +57,7 @@ from .plotUtils import (CosmosLabeller, AllLabeller, StarGalaxyLabeller, Overlap
 import lsst.afw.cameraGeom as cameraGeom
 import lsst.afw.image as afwImage
 import lsst.afw.table as afwTable
+import lsst.daf.butler as dafButler
 import lsst.geom as geom
 import lsst.verify as verify
 
@@ -66,6 +68,8 @@ __all__ = ["CoaddAnalysisConfig", "CoaddAnalysisRunner", "CoaddAnalysisTask", "C
 
 NANOJANSKYS_PER_AB_FLUX = (0*u.ABmag).to_value(u.nJy)
 FLAGCOLORS = ["yellow", "greenyellow", "aquamarine", "orange", "fuchsia", "gold", "lightseagreen", "lime"]
+filterToBandMap = {"HSC-G": "g", "HSC-R": "r", "HSC-R2": "r", "HSC-I": "i", "HSC-I2": "i",
+                   "HSC-Z": "z", "HSC-Y": "y", "NB0921": "z"}
 
 
 class CoaddAnalysisConfig(Config):
@@ -257,6 +261,8 @@ class CoaddAnalysisConfig(Config):
                 self.astromRefObjLoader.ref_dataset_name = "ps1_pv3_3pi_20170110"
             else:
                 self.astromRefObjLoader.ref_dataset_name = self.astromRefCat
+        elif "ref_cat" in self.astromRefCat:
+            self.astromRefObjLoader.ref_dataset_name = self.astromRefCat
         else:
             raise RuntimeError("Unknown astrometry reference catatlog name.  Can be either gaia "
                                "(or gaia_version_date) or ps1 (or ps1_version_date), but got {}".
@@ -267,6 +273,8 @@ class CoaddAnalysisConfig(Config):
                 self.photomRefObjLoader.ref_dataset_name = "ps1_pv3_3pi_20170110"
             else:
                 self.photomRefObjLoader.ref_dataset_name = self.photomRefCat
+        elif "ref_cat" in self.photomRefCat:
+            self.astromRefObjLoader.ref_dataset_name = self.photomRefCat
         else:
             raise RuntimeError("Unknown photometry reference catatlog name.  Must be ps1 or "
                                "ps1_version_date, but got {}".format(self.photomRefCat))
@@ -278,28 +286,85 @@ class CoaddAnalysisRunner(TaskRunner):
         kwargs["cosmos"] = parsedCmd.cosmos
         kwargs["subdir"] = parsedCmd.subdir
 
+        idParser = parsedCmd.id.__class__(parsedCmd.id.level)
+        idParser.idList = parsedCmd.id.idList
+        idParser.datasetType = parsedCmd.id.datasetType
+        idParser.makeDataRefList(parsedCmd)
+
         # Check for existence of appropriate dataset: parquet obj vs. afwTable
         # catalogs.
         datasetList = ["obj"] if parsedCmd.config.doReadParquetTables else ["forced_src", "meas"]
         # Partition all inputs by tract,filter
         FilterRefsDict = functools.partial(defaultdict, list)  # Dict for filter-->dataRefs
-        # Make sure the actual input files requested exist (i.e. do not follow
-        # the parent chain).  If reading afwTable catalogs, first check for
-        # forced catalogs.  Break out of datasets loop if forced catalogs were
-        # found, otherwise continue search for existence of unforced (i.e.
-        # meas) catalogs.
-        for dataset in datasetList:
+
+        if parsedCmd.collection is not None:
+            repoRootDir = "/repo/dc2" if parsedCmd.instrument == "LSSTCam-imSim" else "/repo/main"
+            if parsedCmd.instrument is None:
+                raise RuntimeError("Must provide --instrument command line option for gen3 repos.")
+            butlerGen3 = dafButler.Butler(repoRootDir, collections=parsedCmd.collection,
+                                          instrument=parsedCmd.instrument)
+            butlerGen2 = parsedCmd.butler
+            parsedCmd.butler = butlerGen3
+            kwargs["butlerGen2"] = butlerGen2
+
+            tract = parsedCmd.id.refList[0][0].dataId["tract"]
+            skyMap = butlerGen3.get("skyMap")
+            tractInfo = skyMap.generateTract(tract)
+            # Create a mapping from N,N patchId of Gen2 to integer id of Gen3
+            patchIdToGen3Map = {}
+            for patch in tractInfo:
+                patchIndexStr = str(patch.getIndex()[0]) + "," + str(patch.getIndex()[1])
+                patchIdToGen3Map[patchIndexStr] = tractInfo.getSequentialPatchIndex(patch)
+
             tractFilterRefs = defaultdict(FilterRefsDict)  # tract-->filter-->dataRefs
-            for patchRef in sum(parsedCmd.id.refList, []):
-                tract = patchRef.dataId["tract"]
-                filterName = patchRef.dataId["filter"]
-                inputDataFile = patchRef.get("deepCoadd_" + dataset + "_filename")[0]
-                if parsedCmd.input not in parsedCmd.output:
-                    inputDataFile = inputDataFile.replace(parsedCmd.output, parsedCmd.input)
-                if os.path.exists(inputDataFile):
-                    tractFilterRefs[tract][filterName].append(patchRef)
-            if tractFilterRefs:
-                break
+            patchList = []
+            gen3RefList = []
+            for pId in parsedCmd.id.refList[0]:
+                patchList.append(pId.dataId["patch"])
+
+            gen3PidList = idParser.idList.copy()
+            if len(gen3PidList) == 1 and len(gen3PidList) < len(patchList):
+                gen3PidList = gen3PidList*len(patchList)
+            for gen3Pid, patchId in zip(gen3PidList, patchList):
+                gen3PidCopy = copy.deepcopy(gen3Pid)
+                if "filter" in gen3PidCopy:
+                    gen3PidCopy["physical_filter"] = gen3PidCopy.pop("filter")
+                    physical_filter = gen3PidCopy["physical_filter"]
+                    if parsedCmd.instrument == "HSC":
+                        gen3PidCopy["band"] = filterToBandMap[gen3PidCopy["physical_filter"]]
+                        gen3PidCopy["skymap"] = "hsc_rings_v1"
+                    elif parsedCmd.instrument == "LSSTCam-imSim":
+                        gen3PidCopy["band"] = gen3PidCopy["physical_filter"]
+                        gen3PidCopy["skymap"] = "DC2"
+                    else:
+                        raise RuntimeError("Unknown instrument {}. Currently only know HSC and "
+                                           "LSSTCam-imSim.".format(parsedCmd.instrument))
+                    gen3PidCopy["dataId"] = gen3PidCopy.copy()
+                    gen3PidCopy["butler"] = butlerGen3
+                gen3PidCopy["patchId"] = patchId
+                gen3PidCopy["patch"] = patchIdToGen3Map[patchId]
+                gen3PidCopy["dataId"]["patch"] = patchIdToGen3Map[patchId]
+                gen3PidCopy["camera"] = parsedCmd.instrument
+                gen3RefList.append(gen3PidCopy)
+            tractFilterRefs[tract][physical_filter] = gen3RefList
+        else:
+            # Make sure the actual input files requested exist (i.e. do not
+            # follow the parent chain).  If reading afwTable catalogs, first
+            # check for forced catalogs.  Break out of datasets loop if forced
+            # catalogs were found, otherwise continue search for existence of
+            # unforced (i.e. meas) catalogs.
+            for dataset in datasetList:
+                tractFilterRefs = defaultdict(FilterRefsDict)  # tract-->filter-->dataRefs
+                for patchRef in sum(parsedCmd.id.refList, []):
+                    tract = patchRef.dataId["tract"]
+                    filterName = patchRef.dataId["filter"]
+                    inputDataFile = patchRef.get("deepCoadd_" + dataset + "_filename")[0]
+                    if parsedCmd.input not in parsedCmd.output:
+                        inputDataFile = inputDataFile.replace(parsedCmd.output, parsedCmd.input)
+                    if os.path.exists(inputDataFile):
+                        tractFilterRefs[tract][filterName].append(patchRef)
+                if tractFilterRefs:
+                    break
 
         if not tractFilterRefs:
             raise RuntimeError("No suitable datasets found.")
@@ -319,6 +384,18 @@ class CoaddAnalysisTask(CmdLineTask):
     def _makeArgumentParser(cls):
         parser = ArgumentParser(name=cls._DefaultName)
         parser.add_argument("--cosmos", default=None, help="Filename for Leauthaud Cosmos catalog")
+        parser.add_argument("--collection", required=False, default=None,
+                            help="Collection for rerun if it is Gen3.  NOTE: must still point to a gen2 "
+                            "input to get a valid parsed data reference list and a gen2-stlye rerun for "
+                            "plot persistence.  E.g. "
+                            "/datasets/hsc/repo/ --rerun RC/w_2021_NN/DM-NNNNN:private/username/outDir "
+                            "--collection HSC/runs/RC2/w_2021_NN/DM-NNNNN --instrument HSC or "
+                            "/datasets/DC2/repoRun2.2i "
+                            "--rerun w_2021_NN/DM-NNNNN/multi:private/username/outDir "
+                            " --collection 2.2i/runs/test-med-1/w_2021_NN/DM-NNNNN "
+                            "--instrument LSSTCam-imSim")
+        parser.add_argument("--instrument", required=False, default=None,
+                            help="Instrument for run if it is Gen3")
         parser.add_id_argument("--id", "deepCoadd_meas",
                                help="data ID, e.g. --id tract=12345 patch=1,2 filter=HSC-X",
                                ContainerClass=TractDataIdContainer)
@@ -337,43 +414,72 @@ class CoaddAnalysisTask(CmdLineTask):
 
         self.verifyJob = verify.Job.load_metrics_package(subset="pipe_analysis")
 
-    def runDataRef(self, patchRefList, subdir="", cosmos=None):
+    def runDataRef(self, patchRefList, subdir="", cosmos=None, butlerGen2=None):
         plotList = []
-
-        haveForced = False  # do forced datasets exits (may not for single band datasets)
         dataset = "Coadd_obj" if self.config.doReadParquetTables else "Coadd_forced_src"
+        haveForced = False  # do forced datasets exits (may not for single band datasets)
+        patchRefExistsList = []
+        for patchRef in patchRefList:
+            if hasattr(patchRef, "dataId"):
+                dataId = patchRef.dataId
+                if patchRef.datasetExists(self.config.coaddName + dataset):
+                    patchRefExistsList.append(patchRef)
+            else:
+                dataId = patchRef["dataId"]
+                try:
+                    patchRef["butler"].getURI(self.config.coaddName + dataset, dataId=dataId)
+                except LookupError:
+                    self.log.warn("No {} found for {}.  Skipping patch... ".
+                                  format(self.config.coaddName + dataset, dataId))
+                    continue
+                if "_obj" in dataset:
+                    cat = patchRef["butler"].get(self.config.coaddName + dataset, dataId=dataId)
+                    if dataId["band"] in cat.columns.levels[1]:
+                        patchRefExistsList.append(patchRef)
+                else:
+                    patchRefExistsList.append(patchRef)
+
+        if len(patchRefExistsList) == 0:
+            raise TaskError("No data exists for {}".format(dataset))
+
+        if len(patchRefExistsList) > 0:
+            haveForced = True
+        else:
+            self.log.warn("No forced dataset exists for, e.g.,: {:} (only showing first dataId in "
+                          "patchRefList).\nPlotting unforced results only.".format(dataId))
+            dataset = "Coadd_meas"
+            if not patchRefList[0].datasetExists(self.config.coaddName + dataset):
+                raise TaskError("No data exists in patRefList: %s" %
+                                ([patchRef.dataId for patchRef in patchRefList]))
+
+        repoInfo = getRepoInfo(patchRefExistsList[0], coaddName=self.config.coaddName, coaddDataset=dataset)
         # Explicit input file was checked in CoaddAnalysisRunner, so a check
         # on datasetExists is sufficient here (modulo the case where a forced
         # dataset exists higher up the parent tree than the specified input,
         # but does not exist in the input directory as the former will be
         # found).
-        if patchRefList[0].datasetExists(self.config.coaddName + dataset):
-            haveForced = True
+        dataId = patchRefExistsList[0]["dataId"] if repoInfo.isGen3 else patchRefExistsList[0].dataId
+
         forcedStr = "forced" if haveForced else "unforced"
         if self.config.doBackoutApCorr:
             self.log.info("Backing out aperture corrections from all fluxes")
             forcedStr += "\n (noApCorr)"
-        if not haveForced:
-            self.log.warn("No forced dataset exists for, e.g.,: {:} (only showing first dataId in "
-                          "patchRefList).\nPlotting unforced results only.".format(patchRefList[0].dataId))
-            dataset = "Coadd_meas"
-            if not patchRefList[0].datasetExists(self.config.coaddName + dataset):
-                raise TaskError("No data exists in patRefList: %s" %
-                                ([patchRef.dataId for patchRef in patchRefList]))
-        patchList = [patchRef.dataId["patch"] for patchRef in patchRefList]
+
+        if not repoInfo.isGen3:
+            patchList = [patchRef.dataId["patch"] for patchRef in patchRefExistsList]
+            patchIdList = patchList
+        else:
+            patchList = [patchRef["dataId"]["patch"] for patchRef in patchRefExistsList]
+            patchIdList = [patchRef["patchId"] for patchRef in patchRefExistsList]
         self.log.info("patchList size: {:d}".format(len(patchList)))
-        repoInfo = getRepoInfo(patchRefList[0], coaddName=self.config.coaddName, coaddDataset=dataset)
+
         subdir = "patch-" + str(patchList[0]) if len(patchList) == 1 else subdir
         repoInfo.dataId["subdir"] = "/" + subdir
-        patchRefExistsList = []
-        for patchRef in patchRefList:
-            if patchRef.datasetExists(self.config.coaddName + dataset):
-                patchRefExistsList.append(patchRef)
 
         plotInfoDict = getPlotInfo(repoInfo)
         plotInfoDict.update(dict(plotType="plotCoadd", subdir=subdir, patchList=patchList,
-                                 hscRun=repoInfo.hscRun, tractInfo=repoInfo.tractInfo,
-                                 dataId=repoInfo.dataId, ccdList=None))
+                                 patchIdList=patchIdList, hscRun=repoInfo.hscRun,
+                                 tractInfo=repoInfo.tractInfo, dataId=repoInfo.dataId, ccdList=None))
         # Find a visit/ccd input so that you can check for meas_mosaic input
         # (i.e. to set uberCalLabel).
         self.uberCalLabel = determineExternalCalLabel(repoInfo, patchList[0], coaddName=self.config.coaddName)
@@ -417,9 +523,14 @@ class CoaddAnalysisTask(CmdLineTask):
                 areaDict = catalogStruct.areaDict
 
             patchExistsList = []
+            patchIdExistsList = []
             for patchRef in patchRefExistsList:
-                patchExistsList.append(patchRef.dataId["patch"])
-            plotInfoDict.update(dict(patchList=patchExistsList))
+                patch = patchRef["dataId"]["patch"] if repoInfo.isGen3 else patchRef.dataId["patch"]
+                patchId = patchRef["patchId"] if repoInfo.isGen3 else patchRef.dataId["patch"]
+                patchExistsList.append(patch)
+                patchIdExistsList.append(patchId)
+            plotInfoDict.update(dict(patchIdList=patchIdExistsList))
+            self.log.info("List of patches for which data exists: {}".format(patchIdExistsList))
 
             plotKwargs.update(dict(zpLabel=self.zpLabel))
             unforcedSchema = getSchema(unforced)
@@ -490,17 +601,27 @@ class CoaddAnalysisTask(CmdLineTask):
                                                              areaDict, highlightList=highlightList,
                                                              **plotKwargs))
 
+            if repoInfo.isGen3:  # Add back in filter to dataId so gen2 templates work for putting.
+                repoInfo.dataId["filter"] = repoInfo.dataId["physical_filter"]
             # Create and write parquet tables
             if self.config.doWriteParquetTables:
                 if haveForced:
                     # Add pre-computed columns for parquet tables
                     forced = addPreComputedColumns(forced, fluxToPlotList=self.config.fluxToPlotList,
                                                    toMilli=self.config.toMilli, unforcedCat=unforced)
-                    dataRef_forced = repoInfo.butler.dataRef("analysisCoaddTable_forced",
-                                                             dataId=repoInfo.dataId)
+                    if repoInfo.isGen3:
+                        dataRef_forced = butlerGen2.dataRef("analysisCoaddTable_forced",
+                                                            dataId=repoInfo.dataId)
+                    else:
+                        dataRef_forced = repoInfo.butler.dataRef("analysisCoaddTable_forced",
+                                                                 dataId=repoInfo.dataId)
                     writeParquet(dataRef_forced, forced, badArray=badForced)
-                dataRef_unforced = repoInfo.butler.dataRef("analysisCoaddTable_unforced",
-                                                           dataId=repoInfo.dataId)
+                if repoInfo.isGen3:
+                    dataRef_unforced = butlerGen2.dataRef("analysisCoaddTable_unforced",
+                                                          dataId=repoInfo.dataId)
+                else:
+                    dataRef_unforced = repoInfo.butler.dataRef("analysisCoaddTable_unforced",
+                                                               dataId=repoInfo.dataId)
                 # Add pre-computed columns for parquet tables
                 unforced = addPreComputedColumns(unforced, fluxToPlotList=self.config.fluxToPlotList,
                                                  toMilli=self.config.toMilli)
@@ -610,7 +731,8 @@ class CoaddAnalysisTask(CmdLineTask):
             if cosmos:
                 plotList.append(self.plotCosmos(forced, plotInfoDict, areaDict, cosmos, repoInfo.dataId))
 
-        if self.config.doPlotMatches or self.config.doWriteParquetTables:
+        # Haven't got reference catalog loading working for a gen3 repo...
+        if (self.config.doPlotMatches or self.config.doWriteParquetTables) and not repoInfo.isGen3:
             matchAreaDict = {}
             # First write out unforced match parquet tables
             astromMatches, matchAreaDict = self.readSrcMatches(
@@ -682,8 +804,13 @@ class CoaddAnalysisTask(CmdLineTask):
                         self.log.warn("Could not create match catalog for {:}.  Is "
                                       "lsst.meas.extensions.astrometryNet setup?".format(cat))
 
-        self.allStats, self.allStatsHigh = savePlots(plotList, "plotCoadd", repoInfo.dataId,
-                                                     repoInfo.butler, subdir=subdir)
+        if not repoInfo.isGen3:
+            self.allStats, self.allStatsHigh = savePlots(plotList, "plotCoadd", repoInfo.dataId,
+                                                         repoInfo.butler, subdir=subdir)
+        else:
+            self.allStats, self.allStatsHigh = savePlots(plotList, "plotCoadd", repoInfo.dataId,
+                                                         butlerGen2, subdir=subdir)
+
         metaDict = {kk: plotInfoDict[kk] for kk in ("filter", "tract", "rerun")
                     if plotInfoDict[kk] is not None}
         if plotInfoDict["cameraName"]:
@@ -691,8 +818,11 @@ class CoaddAnalysisTask(CmdLineTask):
         self.verifyJob = updateVerifyJob(self.verifyJob, metaDict=metaDict, specsList=None)
         # TODO: DM-26758 (or DM-14768) should make the following lines a proper
         # butler.put by directly persisting json files.
-        verifyJobFilename = repoInfo.butler.get("coaddAnalysis_verify_job_filename",
-                                                dataId=repoInfo.dataId)[0]
+        if not repoInfo.isGen3:
+            verifyJobFilename = repoInfo.butler.get("coaddAnalysis_verify_job_filename",
+                                                    dataId=repoInfo.dataId)[0]
+        else:
+            verifyJobFilename = butlerGen2.get("coaddAnalysis_verify_job_filename", dataId=repoInfo.dataId)[0]
         self.verifyJob.write(verifyJobFilename)
 
     def readParquetTables(self, dataRefList, dataset, repoInfo, dfDataset=None,
@@ -768,33 +898,52 @@ class CoaddAnalysisTask(CmdLineTask):
         refColsToLoadList = None
         measColsToLoadList = None
         dataRefToRemoveList = []
+        parquetCat = None
+        isMulti = False
         for dataRef in dataRefList:
-            if not dataRef.datasetExists(dataset):
-                self.log.info("Dataset does not exist: {}, {}".format(dataRef.dataId, dataset))
-                continue
-            parquetCat = dataRef.get(dataset, immediate=True)
-            if isinstance(parquetCat, MultilevelParquetTable) and not any(
-                    dfDataset == dfName for dfName in ["forced_src", "meas", "ref"]):
-                raise RuntimeError("Must specify a dfDataset for multilevel parquet tables")
-            if isinstance(parquetCat, MultilevelParquetTable):
-                # Some obj tables do not contain data for all filters
-                try:
-                    existsBandList = parquetCat.columnLevelNames["band"]
-                    filterLevelStr = "band"
-                    bandName = repoInfo.genericBandName
-                except KeyError:
-                    existsBandList = parquetCat.columnLevelNames["filter"]
-                    filterLevelStr = "filter"
-                    bandName = dataRef.dataId["filter"]
-                if bandName not in existsBandList:
-                    self.log.info("Filter {} does not exist for: {}, {}.  Skipping patch...".
-                                  format(dataRef.dataId["filter"], dataRef.dataId, dataset))
-                    dataRefToRemoveList.append(dataRef)
+            dataId = dataRef["dataId"] if repoInfo.isGen3 else dataRef.dataId
+            if not repoInfo.isGen3:
+                if not dataRef.datasetExists(dataset):
+                    self.log.info("Dataset does not exist: {}, {}".format(dataId, dataset))
                     continue
             else:
-                bandName = dataRef.dataId["filter"]
-            if dfLoadColumns is None and isinstance(parquetCat, MultilevelParquetTable):
+                try:
+                    dataRef["butler"].getURI(dataset, dataId=dataId)
+                except LookupError:
+                    continue
+
+            if not repoInfo.isGen3:
+                parquetCat = dataRef.get(dataset, immediate=True)
+            else:
+                butler = dataRef["butler"]
+                if parquetCat is None or not isMulti:
+                    parquetCat = butler.get(dataset, dataId=dataId, immediate=True)
+            isMulti = (isinstance(parquetCat, MultilevelParquetTable)
+                       or isinstance(parquetCat.columns, pd.MultiIndex))
+            if isMulti and not any(dfDataset == dfName for dfName in ["forced_src", "meas", "ref"]):
+                raise RuntimeError("Must specify a dfDataset for multilevel parquet tables")
+            bandName = repoInfo.genericBandName
+            filterLevelStr = "band"
+
+            if isMulti:
+                if isinstance(parquetCat.columns, pd.MultiIndex):
+                    existsBandList = parquetCat.columns.levels[1]
+                elif isinstance(parquetCat, MultilevelParquetTable):
+                    existsBandList = parquetCat.columnLevelNames["band"]
+                else:
+                    existsBandList = None
+
+            if isMulti and existsBandList is not None:
+                # Some obj tables do not contain data for all filters
+                if bandName not in existsBandList:
+                    self.log.info("Filter {} does not exist for: {}, {}.  Skipping patch...".
+                                  format(dataId["filter"], dataId, dataset))
+                    dataRefToRemoveList.append(dataRef)
+                    continue
+
+            if dfLoadColumns is None and isMulti:
                 dfLoadColumns = {"dataset": dfDataset, filterLevelStr: bandName}
+
             # On the first dataRef read in, create list of columns to load
             # based on config lists and their existence in the catalog table.
             if colsToLoadList is None:
@@ -806,27 +955,52 @@ class CoaddAnalysisTask(CmdLineTask):
                     dfLoadColumns = colsToLoadList
                 else:
                     dfLoadColumns.update(column=colsToLoadList)
-            cat = parquetCat.toDataFrame(columns=dfLoadColumns)
-            cat = addElementIdColumn(cat, dataRef.dataId, repoInfo=repoInfo)
+            if isMulti:
+                if hasattr(parquetCat, "toDataFrame"):
+                    cat = parquetCat.toDataFrame(columns=dfLoadColumns)
+                else:
+                    parametersDict = {"columns": dfLoadColumns}
+                    cat = butler.get(dataset, dataId=dataId, parameters=parametersDict)
+                    cat = cat[dfDataset][bandName].copy()
+            else:
+                if hasattr(parquetCat, "toDataFrame"):
+                    cat = parquetCat.toDataFrame(columns=dfLoadColumns)
+                else:
+                    cat = parquetCat[dfLoadColumns].copy()
+            cat = addElementIdColumn(cat, dataId, repoInfo=repoInfo)
             if dfDataset == "forced_src":  # insert some columns from the ref and meas cats for forced cats
                 if refColsToLoadList is None:
                     refColumns = getParquetColumnsList(parquetCat, dfDataset="ref", filterName=bandName)
                     refColsToLoadList = [col for col in refColumns if
                                          (col.startswith(tuple(self.config.columnsToCopyFromRef))
-                                          and not any(s in col for s in self.config.notInColStrList))]
-                ref = parquetCat.toDataFrame(columns={"dataset": "ref", filterLevelStr: bandName,
-                                                      "column": refColsToLoadList})
+                                          and not any(s in col for s in self.config.notInColStrList)
+                                          and not any(s in col for s in colsToLoadList))]
+                refLoadDict = {"dataset": "ref", filterLevelStr: bandName, "column": refColsToLoadList}
+                if hasattr(parquetCat, "toDataFrame"):
+                    ref = parquetCat.toDataFrame(columns=refLoadDict)
+                else:
+                    parametersDict = {"columns": refLoadDict}
+                    ref = butler.get(dataset, dataId=dataRef["dataId"], parameters=parametersDict)
+                    ref = ref["ref"][bandName]
                 cat = pd.concat([cat, ref], axis=1)
                 if measColsToLoadList is None:
                     measColumns = getParquetColumnsList(parquetCat, dfDataset="meas", filterName=bandName)
                     measColsToLoadList = [col for col in measColumns if
                                           (col.startswith(tuple(self.config.columnsToCopyFromMeas))
-                                           and not any(s in col for s in self.config.notInColStrList))]
-                meas = parquetCat.toDataFrame(columns={"dataset": "meas", filterLevelStr: bandName,
-                                                       "column": measColsToLoadList})
+                                           and not any(s in col for s in self.config.notInColStrList)
+                                           and not any(s in col for s in colsToLoadList)
+                                           and not any(s in col for s in refColsToLoadList))]
+                measLoadDict = {"dataset": "meas", filterLevelStr: bandName, "column": measColsToLoadList}
+                if hasattr(parquetCat, "toDataFrame"):
+                    meas = parquetCat.toDataFrame(columns=measLoadDict)
+                else:
+                    parametersDict = {"columns": measLoadDict}
+                    meas = butler.get(dataset, dataId=dataRef["dataId"], parameters=parametersDict)
+                    meas = meas["meas"][bandName]
+
                 cat = pd.concat([cat, meas], axis=1)
 
-            if "patch" in repoInfo.dataId:  # This is a coadd catalog
+            if "patch" in dataId:  # This is a coadd catalog
                 cat = self.calibrateCatalogs(cat, wcs=repoInfo.wcs)
                 catList.append(cat)
             else:  # This is a visit catalog
@@ -835,14 +1009,34 @@ class CoaddAnalysisTask(CmdLineTask):
                 commonZpCat = cat.copy(True)
                 commonZpCat = calibrateSourceCatalog(commonZpCat, self.config.analysis.commonZp)
                 if doApplyExternalPhotoCalib:
-                    if not dataRef.datasetExists(repoInfo.photoCalibDataset):
-                        continue
+                    if not repoInfo.isGen3:
+                        if not dataRef.datasetExists(repoInfo.photoCalibDataset):
+                            self.log.info("Dataset does not exist: {0:r}, {1:s}".
+                                          format(dataId, repoInfo.photoCalibDataset))
+                            continue
+                    else:
+                        try:
+                            dataRef["butler"].getURI(repoInfo.photoCalibDataset, dataId=dataRef["dataId"])
+                        except LookupError:
+                            self.log.info("Dataset does not exist: {0:r}, {1:s}".
+                                          format(dataId, repoInfo.photoCalibDataset))
+                            continue
                 if doApplyExternalSkyWcs:
-                    if not dataRef.datasetExists(repoInfo.skyWcsDataset):
-                        continue
+                    if not repoInfo.isGen3:
+                        if not dataRef.datasetExists(repoInfo.skyWcsDataset):
+                            self.log.info("Dataset does not exist: {0:r}, {1:s}".
+                                          format(dataId, repoInfo.skyWcsDataset))
+                            continue
+                    else:
+                        try:
+                            dataRef["butler"].getURI(repoInfo.skyWcsDataset, dataId=dataId)
+                        except LookupError:
+                            self.log.info("Dataset does not exist: {0:r}, {1:s}".
+                                          format(dataId, repoInfo.skyWcsDataset))
+                            continue
                 fluxMag0 = None
                 if not doApplyExternalPhotoCalib:
-                    photoCalib = repoInfo.butler.get("calexp_photoCalib", dataRef.dataId)
+                    photoCalib = repoInfo.butler.get("calexp" + repoInfo.delimiterStr + "photoCalib", dataId)
                     fluxMag0 = photoCalib.getInstFluxAtZeroMagnitude()
                 cat = self.calibrateCatalogs(dataRef, cat, fluxMag0, repoInfo, doApplyExternalPhotoCalib,
                                              doApplyExternalSkyWcs, useMeasMosaic, iCat=iCat)
@@ -854,7 +1048,7 @@ class CoaddAnalysisTask(CmdLineTask):
             dataRefList.remove(dataRef)
 
         if not catList:
-            raise TaskError("No catalogs read: %s" % ([dataRef.dataId for dataRef in dataRefList]))
+            raise TaskError("No catalogs read: %s" % ([dataId for dataRef in dataRefList]))
         allCats = pd.concat(catList, axis=0)
         # The object "id" is associated with the dataframe index.  Add a
         # column that is the id so that it is available for operations on it,
@@ -1058,15 +1252,26 @@ class CoaddAnalysisTask(CmdLineTask):
         commonZpCatList = []
         catList = []
         dataRefExistsList = []
-        for dataRef in dataRefList:
-            if dataRef.datasetExists(dataset):
-                dataRefExistsList.append(dataRef)
+        if not repoInfo.isGen3:
+            for dataRef in dataRefList:
+                if dataRef.datasetExists(dataset):
+                    dataRefExistsList.append(dataRef)
+        else:
+            for dataRef in dataRefList:
+                dataId = dataRef["dataId"]
+                try:
+                    repoInfo.butler.getURI(dataset, dataId=dataId)
+                    dataRefExistsList.append(dataRef)
+                except LookupError:
+                    print("No URI for ", dataId)
         calexpPrefix = dataset[:dataset.find("_")] if "_" in dataset else ""
-        areaDict, fakeCat = computeAreaDict(repoInfo, dataRefExistsList, dataset=calexpPrefix,
-                                            fakeCat=fakeCat, raFakesCol=raFakesCol, decFakesCol=decFakesCol)
+        try:
+            areaDict, fakeCat = computeAreaDict(repoInfo, dataRefExistsList, dataset=calexpPrefix,
+                                                fakeCat=fakeCat, raFakesCol=raFakesCol,
+                                                decFakesCol=decFakesCol)
+        except (RuntimeError, AttributeError):
+            areaDict, fakeCat = None, None
         for dataRef in dataRefExistsList:
-            if not dataRef.datasetExists(dataset):
-                continue
             if not readFootprintsAs:
                 catFlags = afwTable.SOURCE_IO_NO_FOOTPRINTS
             elif readFootprintsAs == "light":
@@ -1076,7 +1281,12 @@ class CoaddAnalysisTask(CmdLineTask):
             else:
                 raise RuntimeError("Unknown entry for readFootprintsAs: {:}.  Only recognize one of: "
                                    "None, \"light\", or \"heavy\"".format(readFootprintsAs))
-            cat = dataRef.get(dataset, immediate=True, flags=catFlags)
+            dataId = dataRef["dataId"] if repoInfo.isGen3 else dataRef.dataId
+            if not repoInfo.isGen3:
+                cat = dataRef.get(dataset, immediate=True, flags=catFlags)
+            else:
+                butler = dataRef["butler"]
+                cat = butler.get(dataset, dataId=dataId, immediate=True, flags=catFlags)
             # Optionally backout aperture corrections
             if self.config.doBackoutApCorr:
                 cat = backoutApCorr(cat)
@@ -1105,10 +1315,10 @@ class CoaddAnalysisTask(CmdLineTask):
             # "ccd/detector" for visit data (useful to have in Parquet tables
             # for subsequent interactive analysis).
             if "patch" in repoInfo.dataId:  # This is a coadd catalog
-                cat = addIntFloatOrStrColumn(cat, dataRef.dataId["patch"], "patchId",
+                cat = addIntFloatOrStrColumn(cat, dataId["patch"], "patchId",
                                              "Patch on which source was detected")
             else:  # This is a visit catalog
-                cat = addIntFloatOrStrColumn(cat, dataRef.dataId[repoInfo.ccdKey], "ccdId",
+                cat = addIntFloatOrStrColumn(cat, dataId[repoInfo.ccdKey], "ccdId",
                                              "Id of CCD on which source was detected")
                 # Compute Focal Plane coordinates for each source if not
                 # already there.
@@ -1116,7 +1326,7 @@ class CoaddAnalysisTask(CmdLineTask):
                         or self.config.analysisAstromMatches.doPlotFP
                         or self.config.analysisPhotomMatches.doPlotFP):
                     if "base_FPPosition_x" not in schema and "focalplane_x" not in schema:
-                        det = repoInfo.butler.get("calexp_detector", dataRef.dataId)
+                        det = repoInfo.butler.get("calexp_detector", dataId)
                         cat = addFpPoint(det, cat)
 
                 # Scale fluxes to common zeropoint to make basic comparison
@@ -1124,35 +1334,52 @@ class CoaddAnalysisTask(CmdLineTask):
                 commonZpCat = cat.copy(True)
                 commonZpCat = calibrateSourceCatalog(commonZpCat, self.config.analysis.commonZp)
                 commonZpCatList.append(commonZpCat)
-                if self.config.doApplyExternalPhotoCalib:
+                if doApplyExternalPhotoCalib:
                     if repoInfo.hscRun:
                         if not dataRef.datasetExists("fcr_hsc_md") or not dataRef.datasetExists("wcs_hsc"):
                             continue
                     else:
-                        # Check for both jointcal_wcs and wcs for compatibility
-                        # with old datasets.
-                        if not (dataRef.datasetExists(repoInfo.photoCalibDataset)
-                                or dataRef.datasetExists("fcr_md")):
-                            continue
-                if self.config.doApplyExternalSkyWcs:
+                        if not repoInfo.isGen3:
+                            # Check for both jointcal_wcs and wcs for
+                            # compatibility with old datasets.
+                            if not (dataRef.datasetExists(repoInfo.photoCalibDataset)
+                                    or dataRef.datasetExists("fcr_md")):
+                                continue
+                        else:
+                            try:
+                                dataRef["butler"].getURI(repoInfo.photoCalibDataset, dataId=dataRef["dataId"])
+                            except LookupError:
+                                self.log.info("Dataset does not exist: {0:r}, {1:s}".
+                                              format(dataId, repoInfo.photoCalibDataset))
+                                continue
+                if doApplyExternalSkyWcs:
                     if repoInfo.hscRun:
                         if not dataRef.datasetExists("fcr_hsc_md") or not dataRef.datasetExists("wcs_hsc"):
                             continue
                     else:
-                        # Check for both jointcal_wcs and wcs for compatibility
-                        # with old datasets.
-                        if not (dataRef.datasetExists(repoInfo.skyWcsDataset)
-                                or dataRef.datasetExists("wcs")):
-                            continue
+                        if not repoInfo.isGen3:
+                            # Check for both jointcal_wcs and wcs for
+                            # compatibility with old datasets.
+                            if not (dataRef.datasetExists(repoInfo.skyWcsDataset)
+                                    or dataRef.datasetExists("wcs")):
+                                continue
+                        else:
+                            try:
+                                dataRef["butler"].getURI(repoInfo.skyWcsDataset, dataId=dataId)
+                            except LookupError:
+                                self.log.info("Dataset does not exist: {0:r}, {1:s}".
+                                              format(dataId, repoInfo.skyWcsDataset))
+                                continue
+
                 fluxMag0 = None
                 if not doApplyExternalPhotoCalib:
-                    photoCalib = repoInfo.butler.get("calexp_photoCalib", dataRef.dataId)
+                    photoCalib = repoInfo.butler.get("calexp" + repoInfo.delimiterStr + "photoCalib", dataId)
                     fluxMag0 = photoCalib.getInstFluxAtZeroMagnitude()
                 cat = self.calibrateCatalogs(dataRef, cat, fluxMag0, repoInfo, doApplyExternalPhotoCalib,
                                              doApplyExternalSkyWcs, useMeasMosaic, iCat=iCat)
             catList.append(cat)
         if not catList:
-            raise TaskError("No catalogs read: %s" % ([dataRef.dataId for dataRef in dataRefList]))
+            raise TaskError("No catalogs read: %s" % ([dataId for dataRef in dataRefList]))
 
         return Struct(commonZpCatalog=concatenateCatalogs(commonZpCatList),
                       catalog=concatenateCatalogs(catList), areaDict=areaDict, fakeCat=fakeCat)
@@ -1237,11 +1464,19 @@ class CoaddAnalysisTask(CmdLineTask):
         matchList = []
         matchAreaDict = {}
         dataIdSubList = []
+        butler = repoInfo.butler
         for dataRef in dataRefList:
-            if not dataRef.datasetExists(dataset):
-                self.log.info("Dataset does not exist: {0:r}, {1:s}".format(dataRef.dataId, dataset))
-                continue
-            butler = repoInfo.butler
+            dataId = dataRef["dataId"] if repoInfo.isGen3 else dataRef.dataId
+            if not repoInfo.isGen3:
+                if not dataRef.datasetExists(dataset):
+                    self.log.info("Dataset does not exist: {0:r}, {1:s}".format(dataId, dataset))
+                    continue
+            else:
+                try:
+                    dataRef["butler"].getURI(dataset, dataId=dataId)
+                except LookupError:
+                    self.log.info("Dataset does not exist: {0:r}, {1:s}".format(dataId, dataset))
+                    continue
             # Generate unnormalized match list (using load center and radius
             # obtained from the normalized persisted srcMatch catalog) with
             # loadReferencesAndMatchToCatalog (which requires a refObjLoader to
@@ -1261,7 +1496,7 @@ class CoaddAnalysisTask(CmdLineTask):
                                                     useMeasMosaic=useMeasMosaic)
                 areaDict, _ = computeAreaDict(repoInfo, [dataRef, ], dataset=baseDataset)
             else:
-                if "patch" in repoInfo.dataId:  # This is a coadd catalog
+                if "patch" in dataId:  # This is a coadd catalog
                     catalogStruct = self.readAfwCoaddTables([dataRef, ], repoInfo, haveForced,
                                                             aliasDictList=aliasDictList)
                     if "Coadd_meas" in dataset:
@@ -1282,8 +1517,8 @@ class CoaddAnalysisTask(CmdLineTask):
             # analyses.
             mdjList = []
             if "Coadd" in dataset:
-                packedMatches = butler.get(self.config.coaddName + "Coadd_measMatch", dataRef.dataId)
-                coaddUri = butler.getUri(self.config.coaddName + "Coadd_calexp", dataRef.dataId)
+                packedMatches = butler.get(self.config.coaddName + "Coadd_measMatch", dataId)
+                coaddUri = butler.getUri(self.config.coaddName + "Coadd_calexp", dataId)
                 coaddReader = afwImage.ExposureFitsReader(coaddUri)
                 for visit in coaddReader.readCoaddInputs().visits["id"]:
                     try:
@@ -1300,13 +1535,17 @@ class CoaddAnalysisTask(CmdLineTask):
                         mjd = np.nan
                     mdjList.append(mjd)
             else:
-                packedMatches = butler.get(dataset + "Match", dataRef.dataId)
+                packedMatches = butler.get(dataset + "Match", dataId)
                 matchMeta = packedMatches.table.getMetadata()
                 try:
                     mjd = matchMeta.getDouble("EPOCH")
                 except Exception:
                     try:
-                        rawUri = butler.getUri("calexp", dataRef.dataId)
+                        if not repoInfo.isGen3:
+                            rawUri = butler.getUri("calexp", dataId)
+                        else:
+                            rawUri = butler.getURI(dataset + "calexp", dataId)
+                            rawUri = rawUri.path
                         rawReader = afwImage.ExposureFitsReader(rawUri)
                         mjd = rawReader.readMetadata().getDouble("MJD")
                     except Exception:
@@ -1315,12 +1554,12 @@ class CoaddAnalysisTask(CmdLineTask):
             epoch = np.nanmean(mdjList) if not all(np.isnan(mdjList)) else None
 
             if not packedMatches:
-                self.log.warn("No good matches for %s" % (dataRef.dataId,))
+                self.log.warn("No good matches for %s" % (dataId,))
                 continue
             if hasattr(refObjLoader, "apply"):  # Need to/can only do this once per loader
                 refObjLoader = refObjLoader.apply(butler=butler)
             if readPackedMatchesOnly:
-                calibKey = "calib_astrometry_used" if "patch" not in repoInfo.dataId else None
+                calibKey = "calib_astrometry_used" if "patch" not in dataId else None
                 matches = loadDenormalizeAndUnpackMatches(catalog, packedMatches, refObjLoader, epoch=epoch,
                                                           calibKey=calibKey, log=self.log)
                 if matches is None:
@@ -1336,9 +1575,9 @@ class CoaddAnalysisTask(CmdLineTask):
             matches = matchNanojanskyToAB(matches)
             matchAreaDict.update(areaDict)
             if matches.empty:
-                self.log.warn("No matches for %s" % (dataRef.dataId,))
+                self.log.warn("No matches for %s" % (dataId,))
             else:
-                if "patch" not in repoInfo.dataId:  # This is a visit catalog
+                if "patch" not in dataId:  # This is a visit catalog
                     if self.config.doApplyExternalSkyWcs:
                         # Update "distance" between reference and source
                         # matches based on external-calibration positions.
@@ -1347,7 +1586,7 @@ class CoaddAnalysisTask(CmdLineTask):
                         matches["distance"] = angularDist(matches)
 
                     # Avoid multi-counting when visit overlaps multiple tracts
-                    noTractId = dataRef.dataId.copy()
+                    noTractId = dataId.copy()
                     noTractId.pop("tract")
                     if noTractId not in dataIdSubList:
                         matchList.append(matches)
@@ -1355,7 +1594,11 @@ class CoaddAnalysisTask(CmdLineTask):
                 else:
                     matchList.append(matches)
         if not matchList:
-            raise TaskError("No matches read: %s" % ([dataRef.dataId for dataRef in dataRefList]))
+            if repoInfo.isGen3:
+                msg = "No matches read: %s" % ([dataRef.dataId for dataRef in dataRefList])
+            else:
+                msg = "No matches read: %s" % ([dataRef["dataId"] for dataRef in dataRefList])
+            raise TaskError(msg)
 
         allMatches = pd.concat(matchList, axis=0)
         return allMatches, matchAreaDict
@@ -2184,18 +2427,61 @@ class CompareCoaddAnalysisRunner(TaskRunner):
         kwargs["subdir"] = parsedCmd.subdir
         rootDir = parsedCmd.input.split("rerun")[0] if len(parsedCmd.rerun) == 2 else parsedCmd.input
         butlerArgs = dict(root=os.path.join(rootDir, "rerun", parsedCmd.rerun2))
-        if parsedCmd.calib is not None:
-            butlerArgs["calibRoot"] = parsedCmd.calib
-        butler2 = Butler(**butlerArgs)
+        if parsedCmd.collection is not None:
+            if parsedCmd.instrument is None:
+                raise RuntimeError("Must provide --instrument command line option for gen3 repos.")
+            butler2 = dafButler.Butler(parsedCmd.rerun2, collections=parsedCmd.collection,
+                                       instrument=parsedCmd.instrument)
+        else:
+            butlerArgs = dict(root=os.path.join(rootDir, "rerun", parsedCmd.rerun2))
+            if parsedCmd.calib is not None:
+                butlerArgs["calibRoot"] = parsedCmd.calib
+            butler2 = Butler(**butlerArgs)
+            # parsedCmd.butler = butler2
         idParser = parsedCmd.id.__class__(parsedCmd.id.level)
         idParser.idList = parsedCmd.id.idList
-        butler = parsedCmd.butler
-        parsedCmd.butler = butler2
         idParser.makeDataRefList(parsedCmd)
-        parsedCmd.butler = butler
+
+        if parsedCmd.collection is None:
+            butler = parsedCmd.butler
+            parsedCmd.butler = butler2
+            idParser.makeDataRefList(parsedCmd)
+            parsedCmd.butler = butler
+            rerun2RefList = idParser.refList
+        else:
+            tract = parsedCmd.id.refList[0][0].dataId["tract"]
+            skyMap = butler2.get("skyMap")
+            tractInfo = skyMap.generateTract(tract)
+            # Create a mapping from N,N patchId of Gen2 to integer id of Gen3
+            patchIdToGen3Map = {}
+            for patch in tractInfo:
+                patchIndexStr = str(patch.getIndex()[0]) + "," + str(patch.getIndex()[1])
+                patchIdToGen3Map[patchIndexStr] = tractInfo.getSequentialPatchIndex(patch)
+
+            patchList = []
+            gen3RefList = []
+            for pId in parsedCmd.id.refList[0]:
+                patchList.append(pId.dataId["patch"])
+            gen3PidList = idParser.idList.copy()
+            if len(gen3PidList) < len(patchList):
+                gen3PidList = gen3PidList*len(patchList)
+            for gen3Pid, patchId in zip(gen3PidList, patchList):
+                gen3PidCopy = copy.deepcopy(gen3Pid)
+                if "filter" in gen3PidCopy:
+                    gen3PidCopy["physical_filter"] = gen3PidCopy.pop("filter")
+                    gen3PidCopy["band"] = filterToBandMap[gen3PidCopy["physical_filter"]]
+                    gen3PidCopy["skymap"] = "hsc_rings_v1"
+                    gen3PidCopy["dataId"] = gen3PidCopy.copy()
+                    gen3PidCopy["butler"] = butler2
+                gen3PidCopy["dataId"]["patch"] = patchIdToGen3Map[patchId]
+                gen3PidCopy["patch"] = patchIdToGen3Map[patchId]
+                gen3PidCopy["patchId"] = patchId
+                gen3PidCopy["camera"] = parsedCmd.instrument
+                gen3RefList.append(gen3PidCopy)
+            rerun2RefList = [gen3RefList]
 
         return [(refList1, dict(patchRefList2=refList2, **kwargs)) for
-                refList1, refList2 in zip(parsedCmd.id.refList, idParser.refList)]
+                refList1, refList2 in zip(parsedCmd.id.refList, rerun2RefList)]
 
 
 class CompareCoaddAnalysisTask(CoaddAnalysisTask):
@@ -2207,6 +2493,10 @@ class CompareCoaddAnalysisTask(CoaddAnalysisTask):
     def _makeArgumentParser(cls):
         parser = ArgumentParser(name=cls._DefaultName)
         parser.add_argument("--rerun2", required=True, help="Second rerun, for comparison")
+        parser.add_argument("--collection", required=False, default=None,
+                            help="Collection for rerun2 if it is Gen3")
+        parser.add_argument("--instrument", required=False, default=None,
+                            help="Instrument for run if it is Gen3")
         parser.add_id_argument("--id", "deepCoadd_forced_src",
                                help="data ID, e.g. --id tract=12345 patch=1,2 filter=HSC-X",
                                ContainerClass=TractDataIdContainer)
@@ -2229,8 +2519,23 @@ class CompareCoaddAnalysisTask(CoaddAnalysisTask):
         patchRefExistsList1 = [patchRef1 for patchRef1 in patchRefList1 if
                                patchRef1.datasetExists(self.config.coaddName + dataset1)]
         dataset2 = "Coadd_obj" if self.config.doReadParquetTables2 else "Coadd_forced_src"
-        patchRefExistsList2 = [patchRef2 for patchRef2 in patchRefList2 if
-                               patchRef2.datasetExists(self.config.coaddName + dataset2)]
+
+        repoInfo2 = getRepoInfo(patchRefList2[0], coaddName=self.config.coaddName, coaddDataset=dataset2)
+        if not repoInfo2.isGen3:
+            patchRefExistsList2 = [patchRef2 for patchRef2 in patchRefList2 if
+                                   patchRef2.datasetExists(self.config.coaddName + dataset2)]
+        else:
+            patchRefExistsList2 = []
+            for patchRef2 in patchRefList2:
+                dataId = patchRef2["dataId"]
+                try:
+                    patchRef2["butler"].getURI(self.config.coaddName + dataset2, dataId=dataId)
+                    patchRefExistsList2.append(patchRef2)
+                except LookupError:
+                    self.log.info("Could not find {} dataset for dataId {}.  Skipping...".
+                                  format(dataset2, dataId))
+                    continue
+
         if not patchRefExistsList1 or not patchRefExistsList2:
             haveForced = False
         forcedStr = "forced" if haveForced else "unforced"
@@ -2245,12 +2550,15 @@ class CompareCoaddAnalysisTask(CoaddAnalysisTask):
         if not patchRefExistsList1:
             raise TaskError("No data exists in patRefList1: %s" %
                             ([patchRef1.dataId for patchRef1 in patchRefList1]))
-        patchRefList2 = [dataRef2 for dataRef2 in patchRefList2 if
-                         dataRef2.datasetExists(self.config.coaddName + dataset2)]
 
-        patchList1 = [dataRef1.dataId["patch"] for dataRef1 in patchRefList1 if
-                      dataRef1.datasetExists(self.config.coaddName + dataset1)]
+        patchList1 = [patchRef.dataId["patch"] for patchRef in patchRefExistsList1]
+        patchIdList1 = patchList1
+        if repoInfo2.isGen3:
+            patchList2 = [patchRef["patchId"] for patchRef in patchRefExistsList2]
+        else:
+            patchList2 = patchList1
         patchRefList1 = patchRefExistsList1
+        patchRefList2 = patchRefExistsList2
 
         repoInfo1 = getRepoInfo(patchRefList1[0], coaddName=self.config.coaddName, coaddDataset=dataset1)
         repoInfo2 = getRepoInfo(patchRefList2[0], coaddName=self.config.coaddName, coaddDataset=dataset2)
@@ -2259,7 +2567,7 @@ class CompareCoaddAnalysisTask(CoaddAnalysisTask):
         # (i.e. to set uberCalLabel).
         self.uberCalLabel1 = determineExternalCalLabel(repoInfo1, patchList1[0],
                                                        coaddName=self.config.coaddName)
-        self.uberCalLabel2 = determineExternalCalLabel(repoInfo2, patchList1[0],
+        self.uberCalLabel2 = determineExternalCalLabel(repoInfo2, patchList2[0],
                                                        coaddName=self.config.coaddName)
         self.uberCalLabel1 = self.uberCalLabel1.replace("  wcs", "_1  wcs")
         self.uberCalLabel2 = self.uberCalLabel2.replace("  wcs", "_2  wcs")
@@ -2273,7 +2581,6 @@ class CompareCoaddAnalysisTask(CoaddAnalysisTask):
                                                         repoInfo1, "forced_src")
                 unforced1, _ = self.readParquetTables(patchRefList1, self.config.coaddName + "Coadd_obj",
                                                       repoInfo1, "meas")
-                unforced1 = self.calibrateCatalogs(unforced1, wcs=repoInfo1.wcs)
                 areaDict1, _ = computeAreaDict(repoInfo1, patchRefList1,
                                                dataset=self.config.coaddName + "Coadd", fakeCat=None)
             if self.config.doReadParquetTables2:
@@ -2282,7 +2589,6 @@ class CompareCoaddAnalysisTask(CoaddAnalysisTask):
                                                         repoInfo2, "forced_src")
                 unforced2, _ = self.readParquetTables(patchRefList2, self.config.coaddName + "Coadd_obj",
                                                       repoInfo2, "meas")
-                unforced2 = self.calibrateCatalogs(unforced2, wcs=repoInfo2.wcs)
 
         if not self.config.doReadParquetTables1 or not self.config.doReadParquetTables2:
             aliasDictList = [self.config.flagsToAlias, ]
@@ -2347,10 +2653,17 @@ class CompareCoaddAnalysisTask(CoaddAnalysisTask):
         plotKwargs1 = dict(matchRadius=self.matchRadius, matchRadiusUnitStr=self.matchRadiusUnitStr,
                            zpLabel=self.zpLabel, highlightList=highlightList, uberCalLabel=self.uberCalLabel)
         plotInfoDict = getPlotInfo(repoInfo1)
-        plotInfoDict.update(dict(patchList=patchList1, hscRun=hscRun, tractInfo=repoInfo1.tractInfo,
+        try:
+            rerun2Str = list(repoInfo2.butler.storage.repositoryCfgs)[0]
+        except AttributeError:
+            rootDir = str(repoInfo2.butler.datastore.root)
+            rootDir = rootDir.replace("file://", "")
+            rerun2Str = rootDir + repoInfo2.butler.collections[0]
+        plotInfoDict.update(dict(patchList=patchList1, patchIdList=patchIdList1, hscRun=hscRun,
+                                 tractInfo=repoInfo1.tractInfo,
                                  dataId=repoInfo1.dataId, plotType="plotCompareCoadd", subdir=subdir,
                                  hscRun1=repoInfo1.hscRun, hscRun2=repoInfo2.hscRun,
-                                 rerun2=list(repoInfo2.butler.storage.repositoryCfgs)[0]))
+                                 rerun2=rerun2Str))
 
         if self.config.doPlotMags:
             plotList.append(self.plotMags(forced, plotInfoDict, areaDict1, forcedStr=forcedStr,
